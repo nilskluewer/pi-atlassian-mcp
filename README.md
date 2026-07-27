@@ -84,6 +84,21 @@ For local development against your own Pi install, symlink the directory extensi
 
 ```bash
 ln -s "$PWD/extensions/atlassian-mcp" ~/.pi/agent/extensions/atlassian-mcp
+ln -sfn ../../node_modules "$PWD/extensions/atlassian-mcp/node_modules"
+```
+
+The second symlink is required. Pi's loader resolves modules by walking up from the
+*symlink* path (`~/.pi/agent/extensions/...`), not from the real repo path, so it never
+reaches this repo's root `node_modules` and `@modelcontextprotocol/sdk` fails to resolve.
+A failed extension load aborts Pi startup entirely, so getting this wrong breaks every new
+session. This affects local symlink development only - an npm-installed copy resolves
+normally.
+
+Verify through the symlink, from an unrelated directory, not just with `pi -e .` inside
+the repo (which resolves deps the real install path cannot see):
+
+```bash
+cd /tmp && pi -p "say hi"
 ```
 
 Run `/reload` in Pi after changing the source.
