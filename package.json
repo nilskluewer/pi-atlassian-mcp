@@ -38,7 +38,8 @@
     ]
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "mcp-remote": "0.1.38"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
@@ -48,6 +49,11 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "pack:dry": "npm pack --dry-run"
+    "pack:dry": "npm pack --dry-run",
+    "test": "tsx test/sanitizer.test.mts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
   }
 }

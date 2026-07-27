@@ -19,9 +19,23 @@ You opt in per session, and can optionally save a default set.
 pi install npm:@nilskluewer/pi-atlassian-mcp
 ```
 
-Requires `npx` on PATH.
 The extension spawns [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) to reach the remote server, which handles the OAuth 2.1 + PKCE flow and caches tokens for you.
 A browser window opens on first use.
+
+`mcp-remote` is a **pinned dependency** invoked through its locally installed binary, not an unpinned `npx -y` fetch, so the executed code is fixed by this package's lockfile rather than resolved from the registry at runtime.
+
+## Trust model
+
+The MCP server is a remote third party, so everything it returns is treated as untrusted input:
+
+- **Tool names** are validated against `^[A-Za-z0-9_-]{1,64}$` and refused if they would collide with an existing Pi tool, so a server cannot shadow a built-in such as `read` or `bash`.
+- **Input schemas** are deep-cloned with prototype-polluting keys (`__proto__`, `constructor`, `prototype`) removed and depth/size bounds applied. A schema that is not a top-level object schema is refused and its tool is skipped rather than registered.
+- **Descriptions** are stripped of control characters and truncated before they reach the system prompt.
+- **Tool results** are fenced with an explicit untrusted-data notice, because Confluence and Jira content is attacker-influencable and would otherwise read to the model like instructions.
+
+This hardening is a safety net, not a functional restriction: all 31 tools currently exposed by the Atlassian server pass unchanged, with no schema altered.
+
+It does **not** make prompt injection impossible. Anyone who can edit a page you fetch can put text in front of the model. Treat Atlassian content as you would any untrusted web page.
 
 ## Usage
 
@@ -77,8 +91,11 @@ To add your own, add an entry keyed by the raw MCP tool name.
 git clone git@github.com:nilskluewer/pi-atlassian-mcp.git
 cd pi-atlassian-mcp
 npm install
+npm test
 pi -e .
 ```
+
+`npm test` runs offline unit tests for the untrusted-input hardening. No network or Atlassian account required.
 
 For local development against your own Pi install, symlink the directory extension instead of copying it, so there is exactly one real copy on disk:
 
