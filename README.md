@@ -41,33 +41,65 @@ It does **not** make prompt injection impossible. Anyone who can edit a page you
 
 | Command | Scope | What it does |
 |---|---|---|
-| `/atlassian-tools` | session | Connect, list every available tool, toggle the ones you want |
+| `/atlassian-tools` | session, global, or project | Connect, list every available tool, toggle the ones you want, and optionally save the selection |
 | `/atlassian-off` | session | Deactivate all Atlassian tools immediately |
-| `/atlassian-autostart` | global | Toggle whether saved defaults load in new sessions |
+| `/atlassian-autostart [global\|project]` | global or project | Toggle whether the selected scope's saved tools load in new sessions |
 | `/atlassian-reconnect` | session | Drop the cached connection and reconnect, e.g. after re-auth |
 
-In `/atlassian-tools`, toggle tools with `[x]` / `[ ]`, then choose:
+`/atlassian-tools` opens a checkbox list:
 
-- **Apply to this session only** - active now, nothing written to disk, next session starts clean.
-- **Apply + save as default for new sessions** - also persists the selection and enables auto-start.
-- **Cancel** - changes nothing.
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move, wrapping around at both ends |
+| `space` or `enter` | Toggle the highlighted tool |
+| `a` | Select all / none |
+| `enter` on a `▸` row | Apply the selection |
+| `esc` | Cancel, changing nothing |
 
-The picker pre-fills from what is live in the session, falling back to your saved default, so you can start from your usual set and trim it for one session.
+The `▸` rows decide what happens to the selection:
+
+- **Apply to this session** - active now, nothing written to disk, next session starts clean.
+- **Save as global default** - persists the selection in your user configuration for every project without a project override, and loads it automatically in new sessions.
+- **Save as project default** - the same for the current project's configuration.
+  This choice is available only for trusted projects.
+
+Saving turns `autoStart` on: a saved default that does not load is not a default.
+Use `/atlassian-autostart` if you want a saved selection to stay dormant.
+
+The picker pre-fills from what is live in the session, falling back to the effective saved default, so you can start from your usual set and trim it for one session.
+
+## Subagents
+
+A subagent runs as a separate Pi process with no UI, so it can never open the picker.
+When [pi-subagent](https://github.com/nilskluewer/pi-subagent) spawns a child, it publishes the parent's tool set in `PI_SUBAGENT_INHERITED_TOOLS`; this extension activates the `atlassian_*` names it finds there.
+A subagent therefore starts with exactly the Atlassian tools the main agent had, and narrowing a subagent's `tools` allowlist narrows the inherited set too.
+
+Inherited and auto-started selections are registered from a local cache of tool definitions, so neither costs a connection at startup - the MCP server is contacted on the first actual tool call.
 
 ## Configuration
 
-`~/.pi/agent/atlassian-mcp.json`, written only when you explicitly save:
+The global default is `~/.pi/agent/atlassian-mcp.json`.
+A trusted project can override it in `.pi/atlassian-mcp.json` at the project root.
+Project configuration is ignored until Pi trusts the project, and when present it fully overrides the global configuration for that project.
+
+Both files use the same shape and are written only when you explicitly save:
 
 ```json
 {
-  "autoStart": false,
+  "autoStart": true,
   "enabledTools": ["getConfluencePage", "getJiraIssue"]
 }
 ```
 
-- `autoStart` (default `false`) - apply the saved selection on `session_start`.
-  While `false`, no MCP connection is made at startup at all.
+- `autoStart` (default `false`, set to `true` when you save from the picker) - apply the saved selection on `session_start`.
+  Startup never connects: tools are registered from the cache described below.
 - `enabledTools` - raw MCP tool names, without the `atlassian_` prefix.
+
+`~/.pi/agent/atlassian-mcp.cache.json` holds the tool definitions from the last successful discovery.
+It is written automatically, refreshed whenever the picker or `/atlassian-reconnect` talks to the server, ignored after seven days, and safe to delete.
+
+Use `/atlassian-autostart` to toggle the effective scope.
+Use `/atlassian-autostart global` or `/atlassian-autostart project` to change a specific scope.
 
 Tools are exposed to the model as `atlassian_<mcpToolName>`, for example `atlassian_getConfluencePage`.
 

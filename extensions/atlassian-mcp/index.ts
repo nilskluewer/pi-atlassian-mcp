@@ -7,10 +7,12 @@
  *
  * Scope model:
  *   - The picker (/atlassian-tools) always changes the CURRENT SESSION only.
- *   - "Save as default" in the picker additionally persists the selection to
- *     ~/.pi/agent/atlassian-mcp.json so future sessions start with it.
+ *   - The picker can persist its selection globally or for the current trusted
+ *     project. Project configuration overrides the global default. Saving also
+ *     turns `autoStart` on: a saved default that does not load is not a default.
  *   - `autoStart` controls whether saved defaults are applied on session_start.
- *     When false (the default), every session starts clean and you opt in per session.
+ *     Sessions with no saved selection start clean; /atlassian-autostart turns
+ *     auto-loading off again without discarding the selection.
  *
  * Trust model:
  *   The MCP server is a REMOTE third party. Everything it returns - tool names,
@@ -24,13 +26,24 @@
  *   Add an entry keyed by the raw MCP tool name to teach the model a quirk the
  *   server's own description omits.
  *
- * Config file (~/.pi/agent/atlassian-mcp.json):
+ * Subagents:
+ *   A spawned subagent is a separate pi process with no UI, so it can never run
+ *   the picker. The subagent extension publishes the parent's tool set in
+ *   PI_SUBAGENT_INHERITED_TOOLS; any atlassian_* names in there are activated at
+ *   session_start, so a subagent inherits the Atlassian tools the main agent had.
+ *   Tool definitions are served from a local cache, so inheriting costs no
+ *   startup connection - the MCP server is only contacted on the first call.
+ *
+ * Config files:
+ *   ~/.pi/agent/atlassian-mcp.json          (global defaults)
+ *   <project>/.pi/atlassian-mcp.json        (trusted-project override)
  *   { "autoStart": false, "enabledTools": ["getConfluencePage"] }
+ *   ~/.pi/agent/atlassian-mcp.cache.json    (tool definitions, auto-managed)
  *
  * Commands:
  *   /atlassian-tools      - pick tools for this session (optionally save as default)
  *   /atlassian-off        - deactivate all Atlassian tools for this session
- *   /atlassian-autostart  - toggle whether defaults auto-load in new sessions
+ *   /atlassian-autostart  - toggle whether global or project defaults auto-load
  *   /atlassian-reconnect  - force a fresh connection (e.g. after re-auth)
  */
 
@@ -41,12 +54,25 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { pickTools } from "./picker.ts";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const SERVER_URL = "https://mcp.atlassian.com/v1/mcp";
 const TOOL_PREFIX = "atlassian_";
-const CONFIG_DIR = join(homedir(), CONFIG_DIR_NAME, "agent");
-const CONFIG_PATH = join(CONFIG_DIR, "atlassian-mcp.json");
+const GLOBAL_CONFIG_DIR = join(homedir(), CONFIG_DIR_NAME, "agent");
+const GLOBAL_CONFIG_PATH = join(GLOBAL_CONFIG_DIR, "atlassian-mcp.json");
+const CONFIG_FILE_NAME = "atlassian-mcp.json";
+
+/** Discovered tool definitions, cached so non-interactive sessions start cheaply. */
+const TOOL_CACHE_PATH = join(GLOBAL_CONFIG_DIR, "atlassian-mcp.cache.json");
+const TOOL_CACHE_VERSION = 1;
+const TOOL_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Published by the subagent extension: the tool names the parent agent had
+ * active. Used to mirror the parent's Atlassian selection in a child process.
+ */
+const INHERITED_TOOLS_ENV = "PI_SUBAGENT_INHERITED_TOOLS";
 
 /** Bounds applied to anything the remote server sends. */
 const MAX_DESCRIPTION_CHARS = 600;
@@ -75,11 +101,18 @@ interface McpToolDef {
 	inputSchema: unknown;
 }
 
-interface Config {
+export interface Config {
 	/** Apply the saved selection automatically in every new session. */
 	autoStart: boolean;
 	/** Saved default selection, by raw MCP tool name. */
 	enabledTools: string[];
+}
+
+export type ConfigScope = "global" | "project";
+
+export interface ScopedConfig {
+	config: Config;
+	scope: ConfigScope;
 }
 
 type NotifyCtx = { ui: { notify: (message: string, type?: "error" | "info" | "warning") => void } };
@@ -104,24 +137,28 @@ const TOOL_GUIDELINES: Record<string, string[]> = {
 	],
 };
 
-async function loadConfig(): Promise<Config> {
+const DEFAULT_CONFIG: Config = { autoStart: false, enabledTools: [] };
+
+function projectConfigPath(cwd: string): string {
+	return join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+}
+
+async function readConfig(path: string): Promise<Config | undefined> {
 	let raw: string;
 	try {
-		raw = await readFile(CONFIG_PATH, "utf8");
+		raw = await readFile(path, "utf8");
 	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-			return { autoStart: false, enabledTools: [] };
-		}
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		// Unreadable for some other reason (permissions, I/O). Do not silently
 		// pretend the user has no saved defaults.
-		throw new Error(`Cannot read ${CONFIG_PATH}: ${(err as Error).message}`);
+		throw new Error(`Cannot read ${path}: ${(err as Error).message}`);
 	}
 
 	let parsed: { autoStart?: unknown; enabledTools?: unknown };
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		throw new Error(`${CONFIG_PATH} is not valid JSON: ${(err as Error).message}`);
+		throw new Error(`${path} is not valid JSON: ${(err as Error).message}`);
 	}
 
 	return {
@@ -130,9 +167,87 @@ async function loadConfig(): Promise<Config> {
 	};
 }
 
-async function saveConfig(config: Config): Promise<void> {
-	await mkdir(CONFIG_DIR, { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
+async function loadGlobalConfig(): Promise<Config> {
+	return (await readConfig(GLOBAL_CONFIG_PATH)) ?? { ...DEFAULT_CONFIG };
+}
+
+/** Project config is honored only after Pi has trusted the project. */
+export async function loadEffectiveConfig(cwd: string, projectTrusted: boolean): Promise<ScopedConfig> {
+	if (projectTrusted) {
+		const projectConfig = await readConfig(projectConfigPath(cwd));
+		if (projectConfig) return { config: projectConfig, scope: "project" };
+	}
+	return { config: await loadGlobalConfig(), scope: "global" };
+}
+
+/**
+ * Raw MCP names of the Atlassian tools the parent agent had active, if this
+ * process was spawned as a subagent.
+ */
+export function inheritedToolNames(): string[] {
+	const raw = process.env[INHERITED_TOOLS_ENV];
+	if (!raw) return [];
+	return [
+		...new Set(
+			raw
+				.split(",")
+				.map((name) => name.trim())
+				.filter((name) => name.startsWith(TOOL_PREFIX))
+				.map((name) => name.slice(TOOL_PREFIX.length))
+				.filter((name) => TOOL_NAME_PATTERN.test(name)),
+		),
+	];
+}
+
+/**
+ * Tool definitions from the last successful discovery, or undefined when the
+ * cache is absent, unreadable, from another format version, or stale. The
+ * cache only ever accelerates startup; a miss falls back to a live connection.
+ */
+function readToolCache(): McpToolDef[] | undefined {
+	let parsed: { version?: unknown; fetchedAt?: unknown; tools?: unknown };
+	try {
+		parsed = JSON.parse(readFileSync(TOOL_CACHE_PATH, "utf8"));
+	} catch {
+		return undefined;
+	}
+	if (parsed.version !== TOOL_CACHE_VERSION) return undefined;
+	const fetchedAt = typeof parsed.fetchedAt === "number" ? parsed.fetchedAt : 0;
+	if (!fetchedAt || Date.now() - fetchedAt > TOOL_CACHE_MAX_AGE_MS) return undefined;
+	if (!Array.isArray(parsed.tools)) return undefined;
+
+	const tools = parsed.tools.filter(
+		(t): t is McpToolDef =>
+			!!t && typeof t === "object" && typeof (t as McpToolDef).name === "string" && TOOL_NAME_PATTERN.test((t as McpToolDef).name),
+	);
+	return tools.length > 0 ? tools : undefined;
+}
+
+async function writeToolCache(tools: McpToolDef[]): Promise<void> {
+	try {
+		await mkdir(GLOBAL_CONFIG_DIR, { recursive: true });
+		await writeFile(
+			TOOL_CACHE_PATH,
+			JSON.stringify(
+				{
+					version: TOOL_CACHE_VERSION,
+					fetchedAt: Date.now(),
+					tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
+				},
+				null,
+				2,
+			),
+			"utf8",
+		);
+	} catch {
+		// A cache miss next time is the only consequence - never fail a session over it.
+	}
+}
+
+export async function saveConfig(scope: ConfigScope, cwd: string, config: Config): Promise<void> {
+	const path = scope === "project" ? projectConfigPath(cwd) : GLOBAL_CONFIG_PATH;
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, JSON.stringify(config, null, 2), "utf8");
 }
 
 /** Strip control characters and bound the length of remote-supplied text. */
@@ -363,7 +478,22 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		const c = await connect(ctx);
 		const { tools } = await c.listTools();
 		discoveredTools = (tools as McpToolDef[]).filter((t) => TOOL_NAME_PATTERN.test(t.name));
+		await writeToolCache(discoveredTools);
 		return discoveredTools;
+	}
+
+	/**
+	 * Definitions for the requested tools. With `preferCache` (auto-start and
+	 * inherited subagent selections) a complete cache hit avoids connecting;
+	 * the MCP server is then only contacted when a tool is actually called.
+	 */
+	async function resolveToolDefs(wanted: Set<string>, ctx: NotifyCtx, preferCache: boolean): Promise<McpToolDef[]> {
+		if (discoveredTools.length > 0) return discoveredTools;
+		if (preferCache) {
+			const cached = readToolCache();
+			if (cached && [...wanted].every((name) => cached.some((t) => t.name === name))) return cached;
+		}
+		return discoverTools(ctx);
 	}
 
 	/**
@@ -386,7 +516,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		pi.setActiveTools([...new Set([...others, ...desired])]);
 	}
 
-	async function activate(names: Iterable<string>, ctx: NotifyCtx): Promise<string[]> {
+	async function activate(names: Iterable<string>, ctx: NotifyCtx, preferCache = false): Promise<string[]> {
 		const wanted = new Set(names);
 		sessionEnabled.clear();
 		if (wanted.size === 0) {
@@ -394,7 +524,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 			return [];
 		}
 
-		const tools = discoveredTools.length > 0 ? discoveredTools : await discoverTools(ctx);
+		const tools = await resolveToolDefs(wanted, ctx, preferCache);
 		const refused: string[] = [];
 		for (const def of tools) {
 			if (!wanted.has(def.name)) continue;
@@ -422,9 +552,21 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		sessionEnabled.clear();
 		syncActiveTools();
 
+		// A subagent has no UI and therefore no picker: mirror whatever the parent
+		// agent had active instead of consulting the saved defaults.
+		const inherited = inheritedToolNames();
+		if (inherited.length > 0) {
+			try {
+				await activate(inherited, ctx, true);
+			} catch (err) {
+				ctx.ui.notify(`Atlassian MCP: inheriting parent tools failed (${(err as Error).message})`, "warning");
+			}
+			return;
+		}
+
 		let config: Config;
 		try {
-			config = await loadConfig();
+			config = (await loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted())).config;
 		} catch (err) {
 			ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
 			return;
@@ -432,7 +574,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		if (!config.autoStart || config.enabledTools.length === 0) return;
 
 		try {
-			const refused = await activate(config.enabledTools, ctx);
+			const refused = await activate(config.enabledTools, ctx, true);
 			if (refused.length > 0) {
 				ctx.ui.notify(`Atlassian MCP: refused unsafe tool definitions: ${refused.join(", ")}`, "warning");
 			}
@@ -446,24 +588,25 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("atlassian-tools", {
-		description: "Pick Atlassian MCP tools for this session (optionally save as default)",
+		description: "Pick Atlassian MCP tools for this session or save global/project defaults",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("/atlassian-tools needs an interactive UI. Set enabledTools in the config file instead.", "error");
 				return;
 			}
 
-			let config: Config;
+			let scopedConfig: ScopedConfig;
 			try {
-				config = await loadConfig();
+				scopedConfig = await loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 			} catch (err) {
 				ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
 				return;
 			}
+			const { config } = scopedConfig;
 
 			let tools: McpToolDef[];
 			try {
-				tools = await discoverTools(ctx);
+				tools = discoveredTools.length > 0 ? discoveredTools : await discoverTools(ctx);
 			} catch (err) {
 				ctx.ui.notify(`Failed to connect to Atlassian MCP: ${(err as Error).message}`, "error");
 				return;
@@ -475,44 +618,39 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 
 			// Fall back to saved defaults only the first time the picker runs in a
 			// session, so a deliberate "select nothing" is not silently undone.
-			const selection = new Set(pickerTouched ? sessionEnabled : config.enabledTools);
+			const initial = pickerTouched ? sessionEnabled : config.enabledTools;
+			const picked = await pickTools(
+				ctx,
+				tools.map((t) => ({ name: t.name, description: sanitizeText(t.description, 80) })),
+				initial,
+				ctx.isProjectTrusted(),
+			);
+			if (!picked) return;
 
-			const APPLY = "Apply to this session only";
-			const SAVE = "Apply + save as default for new sessions";
-			const CANCEL = "Cancel";
-
-			let action: string | undefined;
-			while (true) {
-				const labels = tools.map(
-					(t) => `${selection.has(t.name) ? "[x]" : "[ ]"} ${t.name} - ${sanitizeText(t.description, 80) ?? ""}`.trim(),
-				);
-				const options = [...labels, APPLY, SAVE, CANCEL];
-				const choice = await ctx.ui.select(
-					`Atlassian MCP tools - ${selection.size} selected (session scope):`,
-					options,
-				);
-				if (!choice || choice === CANCEL) return;
-				if (choice === APPLY || choice === SAVE) {
-					action = choice;
-					break;
-				}
-				const idx = labels.indexOf(choice);
-				if (idx < 0) continue;
-				const name = tools[idx].name;
-				if (selection.has(name)) selection.delete(name);
-				else selection.add(name);
-			}
-
-			const refused = await activate(selection, ctx);
+			const refused = await activate(picked.selection, ctx);
 			pickerTouched = true;
 
-			if (action === SAVE) {
-				// Preserve an explicit autoStart:false; saving a set is not consent
-				// to auto-loading it. Enable it only when it was never configured.
-				await saveConfig({ ...config, enabledTools: [...sessionEnabled] });
+			if (picked.action !== "session") {
+				const scope: ConfigScope = picked.action;
+				// A project config is only written after Pi has explicitly trusted it.
+				if (scope === "project" && !ctx.isProjectTrusted()) {
+					ctx.ui.notify("Atlassian MCP: project configuration requires a trusted project.", "error");
+					return;
+				}
+				let savedConfig: Config;
+				try {
+					// Do not copy a project setting into the global defaults just because
+					// this project currently overrides them.
+					savedConfig = scope === "global" ? await loadGlobalConfig() : config;
+					// Saving a default implies wanting it back next session; otherwise the
+					// selection has to be re-applied by hand in every new session.
+					await saveConfig(scope, ctx.cwd, { ...savedConfig, autoStart: true, enabledTools: [...sessionEnabled] });
+				} catch (err) {
+					ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+					return;
+				}
 				ctx.ui.notify(
-					`Atlassian MCP: ${sessionEnabled.size} tool(s) active and saved as default` +
-						(config.autoStart ? "." : " (auto-start is OFF - enable with /atlassian-autostart)."),
+					`Atlassian MCP: ${sessionEnabled.size} tool(s) active and loaded automatically in new sessions ${scope === "project" ? "in this project" : "everywhere"} (/atlassian-autostart to turn off).`,
 					"info",
 				);
 			} else {
@@ -536,21 +674,43 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("atlassian-autostart", {
-		description: "Toggle whether saved Atlassian tools auto-load in new sessions",
-		handler: async (_args, ctx) => {
+		description: "Toggle auto-start for the effective config, or /atlassian-autostart global|project",
+		handler: async (args, ctx) => {
+			const requestedScope = args.trim().toLowerCase();
+			if (requestedScope && requestedScope !== "global" && requestedScope !== "project") {
+				ctx.ui.notify("Usage: /atlassian-autostart [global|project]", "error");
+				return;
+			}
+
+			let scope: ConfigScope;
 			let config: Config;
 			try {
-				config = await loadConfig();
+				const effective = await loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
+				scope = (requestedScope || effective.scope) as ConfigScope;
+				if (scope === "project" && !ctx.isProjectTrusted()) {
+					ctx.ui.notify("Atlassian MCP: project configuration requires a trusted project.", "error");
+					return;
+				}
+				config = scope === "global"
+					? await loadGlobalConfig()
+					: (await readConfig(projectConfigPath(ctx.cwd))) ?? await loadGlobalConfig();
 			} catch (err) {
 				ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
 				return;
 			}
+
 			const next = !config.autoStart;
-			await saveConfig({ ...config, autoStart: next });
+			try {
+				await saveConfig(scope, ctx.cwd, { ...config, autoStart: next });
+			} catch (err) {
+				ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+				return;
+			}
+			const scopeLabel = scope === "project" ? "for this project" : "globally";
 			ctx.ui.notify(
 				next
-					? `Atlassian MCP auto-start ON (${config.enabledTools.length} saved tool(s) load in new sessions).`
-					: "Atlassian MCP auto-start OFF - use /atlassian-tools per session.",
+					? `Atlassian MCP auto-start ON ${scopeLabel} (${config.enabledTools.length} saved tool(s) load in new sessions).`
+					: `Atlassian MCP auto-start OFF ${scopeLabel} - use /atlassian-tools per session.`,
 				"info",
 			);
 		},

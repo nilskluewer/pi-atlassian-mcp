@@ -3,7 +3,17 @@
  * Run: npm test
  */
 import assert from "node:assert/strict";
-import { sanitizeInputSchema, sanitizeText, TOOL_NAME_PATTERN } from "../extensions/atlassian-mcp/index.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	inheritedToolNames,
+	loadEffectiveConfig,
+	sanitizeInputSchema,
+	sanitizeText,
+	saveConfig,
+	TOOL_NAME_PATTERN,
+} from "../extensions/atlassian-mcp/index.ts";
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -62,5 +72,38 @@ check("rejects names that could break out of the namespace", () => {
 		assert.ok(!TOOL_NAME_PATTERN.test(n), n);
 	}
 });
+
+console.log("subagent tool inheritance");
+check("takes only well-formed atlassian_ entries from the parent tool set", () => {
+	process.env.PI_SUBAGENT_INHERITED_TOOLS =
+		"read,bash,atlassian_getConfluencePage,atlassian_search,atlassian_getConfluencePage,web_search";
+	assert.deepEqual(inheritedToolNames(), ["getConfluencePage", "search"]);
+});
+check("refuses inherited names that are not valid MCP tool names", () => {
+	process.env.PI_SUBAGENT_INHERITED_TOOLS = "atlassian_../evil,atlassian_,atlassian_ok";
+	assert.deepEqual(inheritedToolNames(), ["ok"]);
+});
+check("no env means nothing is inherited", () => {
+	delete process.env.PI_SUBAGENT_INHERITED_TOOLS;
+	assert.deepEqual(inheritedToolNames(), []);
+});
+
+console.log("project configuration");
+const projectDir = await mkdtemp(join(tmpdir(), "pi-atlassian-mcp-test-"));
+try {
+	await saveConfig("project", projectDir, {
+		autoStart: true,
+		enabledTools: ["getConfluencePage"],
+	});
+	const effective = await loadEffectiveConfig(projectDir, true);
+	assert.deepEqual(effective, {
+		scope: "project",
+		config: { autoStart: true, enabledTools: ["getConfluencePage"] },
+	});
+	passed++;
+	console.log("  ok  trusted project configuration overrides global defaults");
+} finally {
+	await rm(projectDir, { recursive: true, force: true });
+}
 
 console.log(`\n${passed} checks passed`);

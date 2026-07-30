@@ -42,7 +42,8 @@
     "mcp-remote": "0.1.38"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "publishConfig": {
     "access": "public",
@@ -53,7 +54,9 @@
     "test": "tsx test/sanitizer.test.mts"
   },
   "devDependencies": {
+    "@earendil-works/pi-tui": "^0.83.0",
     "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   }
 }
