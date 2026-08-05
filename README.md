@@ -22,7 +22,7 @@ pi install npm:@nilskluewer/pi-atlassian-mcp
 The extension spawns [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) to reach the remote server, which handles the OAuth 2.1 + PKCE flow and caches tokens for you.
 A browser window opens on first use.
 
-`mcp-remote` is a **pinned dependency** invoked through its locally installed binary, not an unpinned `npx -y` fetch, so the executed code is fixed by this package's lockfile rather than resolved from the registry at runtime.
+`mcp-remote` is an **exact dependency** invoked through its locally installed binary, not an unpinned `npx -y` fetch, so the executed version is fixed by this package's published dependency manifest rather than resolved from the registry at runtime.
 
 ## Trust model
 
