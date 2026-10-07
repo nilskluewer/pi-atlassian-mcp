@@ -55,7 +55,7 @@ import { createRequire } from "node:module";
 import { CONFIG_DIR_NAME, formatSize, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { pickTools } from "./picker.ts";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const SERVER_URL = "https://mcp.atlassian.com/v1/mcp";
 const TOOL_PREFIX = "atlassian_";
@@ -408,6 +408,28 @@ export function registerMcpTool(
 	return true;
 }
 
+/**
+ * Proxy and CA variables mcp-remote needs behind a corporate or sandbox proxy
+ * (e.g. nono). The MCP SDK otherwise passes only HOME, LOGNAME, PATH, SHELL, TERM, USER.
+ */
+const NETWORK_ENV_VARS = [
+	"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+	"NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+];
+
+function mcpRemoteEnv(): Record<string, string> {
+	const env = getDefaultEnvironment();
+	for (const name of NETWORK_ENV_VARS) {
+		const value = process.env[name];
+		if (value) env[name] = value;
+	}
+	return env;
+}
+
+function usesProxy(env: Record<string, string>): boolean {
+	return Boolean(env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy);
+}
+
 /** Absolute path to the pinned mcp-remote CLI, resolved from node_modules. */
 function resolveMcpRemoteBin(): string {
 	const require = createRequire(import.meta.url);
@@ -468,11 +490,13 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		if (connecting) return connecting;
 
 		connecting = (async () => {
+			const env = mcpRemoteEnv();
 			const transport = new StdioClientTransport({
 				// Pinned dependency invoked directly, rather than `npx -y mcp-remote`
 				// which would resolve and execute the latest registry version at runtime.
 				command: process.execPath,
-				args: [resolveMcpRemoteBin(), SERVER_URL],
+				args: [resolveMcpRemoteBin(), SERVER_URL, ...(usesProxy(env) ? ["--enable-proxy"] : [])],
+				env,
 				stderr: "pipe",
 			});
 
