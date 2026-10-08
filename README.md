@@ -1,6 +1,6 @@
 # pi-atlassian-mcp
 
-Bridge the [Atlassian Rovo MCP server](https://github.com/atlassian/atlassian-mcp-server) (Jira, Confluence, Compass, Bitbucket) into [Pi](https://pi.dev), with **per-session, opt-in tool selection**.
+Bridge the [Atlassian Rovo MCP server](https://github.com/atlassian/atlassian-mcp-server) (Jira, Confluence, Compass, Bitbucket) into [Pi](https://pi.dev), with **per-session, opt-in tool selection** and optional **Confluence page-tree authorization**.
 
 Pi deliberately ships without built-in MCP support.
 This extension adds it for one specific server, and adds the thing a generic MCP client usually lacks: precise control over *which* tools are exposed and *when*.
@@ -45,6 +45,7 @@ It does **not** make prompt injection impossible. Anyone who can edit a page you
 | `/atlassian-off` | session | Deactivate all Atlassian tools immediately |
 | `/atlassian-autostart [global\|project]` | global or project | Toggle whether the selected scope's saved tools load in new sessions |
 | `/atlassian-reconnect` | session | Drop the cached connection and reconnect, e.g. after re-auth |
+| `/atlassian-pages` | session, global, or project | Add Confluence root pages and restrict edits to those pages and all descendants |
 
 `/atlassian-tools` opens a checkbox list:
 
@@ -68,6 +69,41 @@ Use `/atlassian-autostart` if you want a saved selection to stay dormant.
 
 The picker pre-fills from what is live in the session, falling back to the effective saved default, so you can start from your usual set and trim it for one session.
 
+## Confluence page scope
+
+Use a page scope when the agent may edit some Confluence pages but must only read all others.
+Pick one or more root pages. Each root page and all its descendants can be edited. All other pages stay readable but cannot be edited.
+
+```text
+/atlassian-pages add https://rewe.atlassian.net/wiki/spaces/ATools/pages/1658063227/Claude+Code+-+setup+and+settings
+/atlassian-pages save project      # or: save global
+```
+
+| Subcommand | What it does |
+|---|---|
+| *(none)* | Show the current scope and open a menu |
+| `add <page URL>` | Check the page with Confluence and add it as a root page for this session |
+| `remove <page URL or ID>` | Remove a root page from this session |
+| `clear` | Remove the scope: Confluence edits are not restricted |
+| `save global` / `save project` | Keep the current scope in the global or project configuration |
+| `list` | Show the root pages |
+
+The scope is an authorization check in the extension, not a prompt instruction.
+Every Confluence write is checked immediately before it is sent to the MCP server:
+
+- `updateConfluencePage` - the page must be in a scoped tree. A move (`parentId`, `spaceId`) must also stay in the tree.
+- `createConfluencePage` - `parentId` is required and must be in a scoped tree, in the root page's space.
+- `createConfluenceFooterComment` / `createConfluenceInlineComment` - `pageId` must be in a scoped tree. Replies and comments on attachments are refused, because `pageId` cannot prove where they land.
+- Blog posts and Confluence write tools that the policy does not know are refused.
+- Reads, search, and Jira tools are not affected.
+
+Tree membership is checked with a CQL `ancestor` search, with the descendants endpoint as a fallback.
+Pages created in a scoped tree during the session can be edited at once, before the search index has them.
+
+A saved scope always loads, also when `autoStart` is off.
+Subagents inherit the parent's scope through `PI_ATLASSIAN_PAGE_SCOPES`.
+If a saved or inherited scope cannot be read, all Confluence writes are refused until you fix it with `/atlassian-pages`.
+
 ## Subagents
 
 A subagent runs as a separate Pi process with no UI, so it can never open the picker.
@@ -87,13 +123,15 @@ Both files use the same shape and are written only when you explicitly save:
 ```json
 {
   "autoStart": true,
-  "enabledTools": ["getConfluencePage", "getJiraIssue"]
+  "enabledTools": ["getConfluencePage", "getJiraIssue"],
+  "pageScopes": [{ "siteHost": "rewe.atlassian.net", "rootPageId": "1658063227" }]
 }
 ```
 
 - `autoStart` (default `false`, set to `true` when you save from the picker) - apply the saved selection on `session_start`.
   Startup never connects: tools are registered from the cache described below.
 - `enabledTools` - raw MCP tool names, without the `atlassian_` prefix.
+- `pageScopes` (optional) - Confluence root pages that edits are restricted to. Written by `/atlassian-pages save`. An invalid entry makes the file fail to load, which blocks all Confluence writes.
 
 `~/.pi/agent/atlassian-mcp.cache.json` holds the tool definitions from the last successful discovery.
 It is written automatically, refreshed whenever the picker or `/atlassian-reconnect` talks to the server, ignored after seven days, and safe to delete.
@@ -135,7 +173,8 @@ npm test
 pi -e .
 ```
 
-`npm test` runs offline unit tests for the untrusted-input hardening. No network or Atlassian account required.
+`npm test` runs offline unit tests for the untrusted-input hardening, proxy handling, and page scope. No network or Atlassian account required.
+`npm run test:e2e` starts real Pi processes to check that project defaults persist. It needs a local `pi`, but no network.
 
 For local development against your own Pi install, symlink the directory extension instead of copying it, so there is exactly one real copy on disk:
 

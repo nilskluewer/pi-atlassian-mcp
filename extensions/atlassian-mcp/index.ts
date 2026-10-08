@@ -34,10 +34,21 @@
  *   Tool definitions are served from a local cache, so inheriting costs no
  *   startup connection - the MCP server is only contacted on the first call.
  *
+ * Confluence page scope:
+ *   /atlassian-pages applies a runtime Confluence page-tree authorization policy
+ *   to the current session and can persist it globally or per project. A root
+ *   page includes all descendants. While a page scope is active, every
+ *   Confluence write is checked against the selected trees immediately before
+ *   it is sent; writes outside the trees and unknown Confluence writes are
+ *   denied. Reads and Jira tools stay available. Saved page scopes always load,
+ *   independent of autoStart, and subagents inherit the parent's page scope
+ *   through PI_ATLASSIAN_PAGE_SCOPES. Malformed inherited state fails closed.
+ *
  * Config files:
  *   ~/.pi/agent/atlassian-mcp.json          (global defaults)
  *   <project>/.pi/atlassian-mcp.json        (trusted-project override)
- *   { "autoStart": false, "enabledTools": ["getConfluencePage"] }
+ *   { "autoStart": false, "enabledTools": ["getConfluencePage"],
+ *     "pageScopes": [{ "siteHost": "rewe.atlassian.net", "rootPageId": "1658063227" }] }
  *   ~/.pi/agent/atlassian-mcp.cache.json    (tool definitions, auto-managed)
  *
  * Commands:
@@ -45,6 +56,7 @@
  *   /atlassian-off        - deactivate all Atlassian tools for this session
  *   /atlassian-autostart  - toggle whether global or project defaults auto-load
  *   /atlassian-reconnect  - force a fresh connection (e.g. after re-auth)
+ *   /atlassian-pages      - restrict Confluence writes to selected page trees
  */
 
 import { homedir } from "node:os";
@@ -56,6 +68,17 @@ import { CONFIG_DIR_NAME, formatSize, truncateHead, type ExtensionAPI } from "@e
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { pickTools } from "./picker.ts";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+	classifyPageScopeTool,
+	deduplicatePageScopes,
+	normalizePageScope,
+	pageScopeKey,
+	PageScopeDeniedError,
+	PageScopePolicy,
+	parseConfluencePageUrl,
+	validatePageScopeRoot,
+	type PageScope,
+} from "./scope.ts";
 
 const SERVER_URL = "https://mcp.atlassian.com/v1/mcp";
 const TOOL_PREFIX = "atlassian_";
@@ -64,7 +87,7 @@ const GLOBAL_CONFIG_PATH = join(GLOBAL_CONFIG_DIR, "atlassian-mcp.json");
 const CONFIG_FILE_NAME = "atlassian-mcp.json";
 
 /** Discovered tool definitions, cached so non-interactive sessions start cheaply. */
-const TOOL_CACHE_PATH = join(GLOBAL_CONFIG_DIR, "atlassian-mcp.cache.json");
+const TOOL_CACHE_PATH = process.env.PI_ATLASSIAN_MCP_CACHE_PATH || join(GLOBAL_CONFIG_DIR, "atlassian-mcp.cache.json");
 const TOOL_CACHE_VERSION = 1;
 const TOOL_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -73,6 +96,12 @@ const TOOL_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
  * active. Used to mirror the parent's Atlassian selection in a child process.
  */
 const INHERITED_TOOLS_ENV = "PI_SUBAGENT_INHERITED_TOOLS";
+
+/**
+ * The active page scope as JSON. Set in this process whenever the scope
+ * changes, so child processes (subagents) inherit the same write boundary.
+ */
+export const PAGE_SCOPES_ENV = "PI_ATLASSIAN_PAGE_SCOPES";
 
 /** Bounds applied to anything the remote server sends. */
 const MAX_DESCRIPTION_CHARS = 600;
@@ -133,6 +162,8 @@ export interface Config {
 	autoStart: boolean;
 	/** Saved default selection, by raw MCP tool name. */
 	enabledTools: string[];
+	/** Confluence page trees that writes are restricted to. Empty means no restriction. */
+	pageScopes?: PageScope[];
 }
 
 export type ConfigScope = "global" | "project";
@@ -162,6 +193,12 @@ const TOOL_GUIDELINES: Record<string, string[]> = {
 	getConfluencePageDescendants: [
 		"When listing results from atlassian_getConfluencePageDescendants, check each entry's status field and flag any draft pages, especially drafts whose title duplicates a published sibling, before relying on or citing them.",
 	],
+	updateConfluencePage: [
+		"When atlassian_updateConfluencePage fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Report this to the user and do not try another way to change the page.",
+	],
+	createConfluencePage: [
+		"When atlassian_createConfluencePage fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Pass a parentId inside an allowed tree, or report the block to the user.",
+	],
 };
 
 const DEFAULT_CONFIG: Config = { autoStart: false, enabledTools: [] };
@@ -181,7 +218,7 @@ async function readConfig(path: string): Promise<Config | undefined> {
 		throw new Error(`Cannot read ${path}: ${(err as Error).message}`);
 	}
 
-	let parsed: { autoStart?: unknown; enabledTools?: unknown };
+	let parsed: { autoStart?: unknown; enabledTools?: unknown; pageScopes?: unknown };
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
@@ -191,7 +228,39 @@ async function readConfig(path: string): Promise<Config | undefined> {
 	return {
 		autoStart: parsed.autoStart === true,
 		enabledTools: Array.isArray(parsed.enabledTools) ? parsed.enabledTools.filter((n) => typeof n === "string") : [],
+		...(parsed.pageScopes !== undefined ? { pageScopes: parsePageScopes(parsed.pageScopes, path) } : {}),
 	};
+}
+
+/**
+ * A saved page scope is a security boundary. An entry that cannot be parsed
+ * must not silently widen write access, so the whole file is refused.
+ */
+function parsePageScopes(raw: unknown, source: string): PageScope[] {
+	if (raw === undefined) return [];
+	if (!Array.isArray(raw)) throw new Error(`${source}: pageScopes must be an array`);
+	const scopes: PageScope[] = [];
+	for (const entry of raw) {
+		const scope = normalizePageScope(entry);
+		if (!scope) throw new Error(`${source}: invalid pageScopes entry ${JSON.stringify(entry)}`);
+		scopes.push(scope);
+	}
+	return deduplicatePageScopes(scopes);
+}
+
+/**
+ * Page scopes published by a parent process. Undefined means no inherited
+ * scope; "invalid" means the variable is set but unusable and must fail closed.
+ */
+export function inheritedPageScopes(): PageScope[] | "invalid" | undefined {
+	const raw = process.env[PAGE_SCOPES_ENV];
+	if (raw === undefined || raw === "") return undefined;
+	try {
+		const scopes = parsePageScopes(JSON.parse(raw), PAGE_SCOPES_ENV);
+		return scopes.length > 0 ? scopes : "invalid";
+	} catch {
+		return "invalid";
+	}
 }
 
 async function loadGlobalConfig(): Promise<Config> {
@@ -348,11 +417,22 @@ function toolNameFor(mcpName: string): string {
 type McpToolRegistrar = Pick<ExtensionAPI, "getAllTools" | "registerTool">;
 
 /** Register one remote tool, refusing anything we cannot safely represent. */
+export type AuthorizeCall = (
+	name: string,
+	args: Record<string, unknown>,
+	signal: AbortSignal | undefined,
+	ctx: NotifyCtx,
+) => Promise<Record<string, unknown>>;
+
+export type CallSucceeded = (name: string, args: Record<string, unknown>, result: unknown) => void;
+
 export function registerMcpTool(
 	pi: McpToolRegistrar,
 	def: McpToolDef,
 	connect: (ctx: NotifyCtx) => Promise<Client>,
 	registeredNames: Set<string>,
+	authorize?: AuthorizeCall,
+	onSuccess?: CallSucceeded,
 ): boolean {
 	if (!TOOL_NAME_PATTERN.test(def.name)) return false;
 
@@ -377,14 +457,20 @@ export function registerMcpTool(
 		promptSnippet: `${snippet} (Atlassian)`,
 		parameters: parameters as never,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			let args = params as Record<string, unknown>;
+			if (authorize) {
+				try {
+					args = await authorize(def.name, args, signal, ctx);
+				} catch (err) {
+					// A denial is our own trusted decision, not third-party data.
+					if (err instanceof PageScopeDeniedError) throw err;
+					throw new Error(formatThrownToolError(err));
+				}
+			}
 			let result;
 			try {
 				const c = await connect(ctx);
-				result = await c.callTool(
-					{ name: def.name, arguments: params as Record<string, unknown> },
-					undefined,
-					{ signal },
-				);
+				result = await c.callTool({ name: def.name, arguments: args }, undefined, { signal });
 			} catch (err) {
 				throw new Error(formatThrownToolError(err));
 			}
@@ -397,6 +483,7 @@ export function registerMcpTool(
 			if (result.isError) {
 				throw new Error(formatToolErrorText(parts));
 			}
+			onSuccess?.(def.name, args, result);
 
 			return {
 				content: [{ type: "text" as const, text: formatToolResultText(parts) }],
@@ -464,6 +551,65 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 	 */
 	let turnActive = false;
 	let pendingSync = false;
+
+	/**
+	 * Confluence write boundary for this session. "invalid" means the saved or
+	 * inherited scope could not be read; all Confluence writes are then denied.
+	 */
+	/** Read once: later session_start events in this process see our own env writes. */
+	const inheritedScopesAtLoad = inheritedPageScopes();
+
+	let pageScope: { kind: "none" } | { kind: "active"; policy: PageScopePolicy } | { kind: "invalid"; reason: string } = {
+		kind: "none",
+	};
+
+	function activeScopes(): PageScope[] {
+		return pageScope.kind === "active" ? pageScope.policy.getScopes() : [];
+	}
+
+	function setPageScope(next: typeof pageScope, ctx?: { ui: { setStatus?: (key: string, text: string | undefined) => void } }) {
+		pageScope = next;
+		if (next.kind === "active") process.env[PAGE_SCOPES_ENV] = JSON.stringify(next.policy.getScopes());
+		else if (next.kind === "invalid") process.env[PAGE_SCOPES_ENV] = "invalid";
+		else delete process.env[PAGE_SCOPES_ENV];
+
+		const status =
+			next.kind === "active"
+				? `Confluence edits: ${next.policy.getScopes().length} page tree(s)`
+				: next.kind === "invalid"
+					? "Confluence edits: blocked (invalid page scope)"
+					: undefined;
+		ctx?.ui.setStatus?.("atlassian-pages", status);
+	}
+
+	function applyScopes(scopes: PageScope[], ctx?: Parameters<typeof setPageScope>[1]) {
+		setPageScope(scopes.length > 0 ? { kind: "active", policy: new PageScopePolicy(scopes) } : { kind: "none" }, ctx);
+	}
+
+	/** Run an MCP tool for the policy itself (hierarchy lookups), bypassing authorization. */
+	function scopeCallTool(ctx: NotifyCtx) {
+		return async (name: string, args: Record<string, unknown>, signal?: AbortSignal) => {
+			const c = await connect(ctx);
+			return c.callTool({ name, arguments: args }, undefined, { signal });
+		};
+	}
+
+	const authorizeCall: AuthorizeCall = async (name, args, signal, ctx) => {
+		if (pageScope.kind === "invalid") {
+			if (classifyPageScopeTool(name) === "confluence-write") {
+				throw new PageScopeDeniedError(
+					`Atlassian page scope blocked ${name}: the page scope is invalid (${pageScope.reason}). Fix it with /atlassian-pages.`,
+				);
+			}
+			return args;
+		}
+		if (pageScope.kind === "none") return args;
+		return pageScope.policy.authorize(name, args, scopeCallTool(ctx), signal);
+	};
+
+	const callSucceeded: CallSucceeded = (name, args, result) => {
+		if (pageScope.kind === "active") pageScope.policy.noteSuccessfulCall(name, args, result);
+	};
 
 	function forgetConnection(dead: Client) {
 		if (client === dead) {
@@ -593,7 +739,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		const refused: string[] = [];
 		for (const def of tools) {
 			if (!wanted.has(def.name)) continue;
-			if (registerMcpTool(pi, def, connect, registeredNames)) sessionEnabled.add(def.name);
+			if (registerMcpTool(pi, def, connect, registeredNames, authorizeCall, callSucceeded)) sessionEnabled.add(def.name);
 			else refused.push(def.name);
 		}
 		syncActiveTools();
@@ -617,6 +763,26 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		sessionEnabled.clear();
 		syncActiveTools();
 
+		// The page scope is a security boundary: resolve it before any tool can
+		// run. A parent's scope wins over saved config; errors fail closed.
+		const inheritedScopes = inheritedScopesAtLoad;
+		let scopedConfig: ScopedConfig | undefined;
+		let configError: Error | undefined;
+		try {
+			scopedConfig = await loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
+		} catch (err) {
+			configError = err as Error;
+		}
+		if (inheritedScopes === "invalid") {
+			setPageScope({ kind: "invalid", reason: `${PAGE_SCOPES_ENV} is malformed` }, ctx);
+		} else if (inheritedScopes) {
+			applyScopes(inheritedScopes, ctx);
+		} else if (configError) {
+			setPageScope({ kind: "invalid", reason: "the config file could not be read" }, ctx);
+		} else {
+			applyScopes(scopedConfig?.config.pageScopes ?? [], ctx);
+		}
+
 		// A subagent has no UI and therefore no picker: mirror whatever the parent
 		// agent had active instead of consulting the saved defaults.
 		const inherited = inheritedToolNames();
@@ -629,13 +795,11 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		let config: Config;
-		try {
-			config = (await loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted())).config;
-		} catch (err) {
-			ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+		if (configError || !scopedConfig) {
+			ctx.ui.notify(`Atlassian MCP: ${configError?.message ?? "config unavailable"}`, "error");
 			return;
 		}
+		const { config } = scopedConfig;
 		if (!config.autoStart || config.enabledTools.length === 0) return;
 
 		try {
@@ -778,6 +942,140 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 					: `Atlassian MCP auto-start OFF ${scopeLabel} - use /atlassian-tools per session.`,
 				"info",
 			);
+		},
+	});
+
+	async function savePageScopes(scope: ConfigScope, ctx: NotifyCtx & { cwd: string; isProjectTrusted(): boolean }) {
+		if (scope === "project" && !ctx.isProjectTrusted()) {
+			throw new Error("project configuration requires a trusted project.");
+		}
+		const base =
+			scope === "global"
+				? await loadGlobalConfig()
+				: ((await readConfig(projectConfigPath(ctx.cwd))) ?? (await loadGlobalConfig()));
+		await saveConfig(scope, ctx.cwd, { ...base, pageScopes: activeScopes() });
+	}
+
+	function describeScopes(): string {
+		if (pageScope.kind === "invalid") return `All Confluence edits are blocked: ${pageScope.reason}.`;
+		const scopes = activeScopes();
+		if (scopes.length === 0) return "No page scope: Confluence edits are not restricted.";
+		return [
+			"Confluence edits are allowed only in these page trees (root page and all descendants). Other pages stay readable:",
+			...scopes.map((s) => `  - ${s.title ?? "(untitled)"} - https://${s.siteHost}/wiki/pages/viewpage.action?pageId=${s.rootPageId}`),
+		].join("\n");
+	}
+
+	pi.registerCommand("atlassian-pages", {
+		description: "Restrict Confluence edits to page trees: /atlassian-pages [add <url> | remove <url|id> | clear | save global|project | list]",
+		getArgumentCompletions: (prefix: string) => {
+			const subcommands = ["add ", "remove ", "clear", "save global", "save project", "list"];
+			const matches = subcommands.filter((s) => s.startsWith(prefix.trimStart()));
+			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s.trim() })) : null;
+		},
+		handler: async (args, ctx) => {
+			let [sub = "", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			let value = rest.join(" ");
+
+			if (!sub) {
+				ctx.ui.notify(describeScopes(), "info");
+				if (!ctx.hasUI) return;
+				const choice = await ctx.ui.select("Confluence page scope", [
+					"Add a root page (URL)",
+					"Remove a root page",
+					"Clear (allow all Confluence edits)",
+					"Save as global default",
+					"Save as project default",
+				]);
+				if (!choice) return;
+				if (choice.startsWith("Add")) {
+					sub = "add";
+					value = (await ctx.ui.input("Confluence page URL", "https://<site>.atlassian.net/wiki/spaces/<space>/pages/<id>/...")) ?? "";
+					if (!value.trim()) return;
+				} else if (choice.startsWith("Remove")) {
+					const scopes = activeScopes();
+					if (scopes.length === 0) {
+						ctx.ui.notify("No root pages to remove.", "info");
+						return;
+					}
+					const labels = scopes.map((s) => `${s.title ?? "(untitled)"} (${s.rootPageId})`);
+					const picked = await ctx.ui.select("Remove root page", labels);
+					if (!picked) return;
+					sub = "remove";
+					value = scopes[labels.indexOf(picked)]!.rootPageId;
+				} else if (choice.startsWith("Clear")) {
+					sub = "clear";
+				} else {
+					sub = "save";
+					value = choice.includes("global") ? "global" : "project";
+				}
+			}
+
+			try {
+				switch (sub) {
+					case "list":
+						ctx.ui.notify(describeScopes(), "info");
+						return;
+					case "add": {
+						const parsed = parseConfluencePageUrl(value);
+						if (!parsed) {
+							ctx.ui.notify("Usage: /atlassian-pages add https://<site>.atlassian.net/wiki/spaces/<space>/pages/<id>/...", "error");
+							return;
+						}
+						const root = await validatePageScopeRoot(parsed, scopeCallTool(ctx));
+						const current = activeScopes();
+						if (current.some((s) => pageScopeKey(s) === pageScopeKey(root))) {
+							ctx.ui.notify(`"${root.title ?? root.rootPageId}" is already in the page scope.`, "info");
+							return;
+						}
+						applyScopes([...current, root], ctx);
+						ctx.ui.notify(
+							`Confluence edits now restricted for this session. Added "${root.title ?? root.rootPageId}" and all its descendants. Use "/atlassian-pages save global|project" to keep it.`,
+							"info",
+						);
+						return;
+					}
+					case "remove": {
+						const id = parseConfluencePageUrl(value)?.rootPageId ?? value.trim();
+						const current = activeScopes();
+						const next = current.filter((s) => s.rootPageId !== id);
+						if (next.length === current.length) {
+							ctx.ui.notify(`Page ${id || "(none)"} is not in the page scope.`, "error");
+							return;
+						}
+						applyScopes(next, ctx);
+						ctx.ui.notify(
+							next.length > 0 ? `Removed page ${id} from the page scope (session only).` : "Page scope removed: Confluence edits are no longer restricted in this session.",
+							next.length > 0 ? "info" : "warning",
+						);
+						return;
+					}
+					case "clear":
+						applyScopes([], ctx);
+						ctx.ui.notify("Page scope cleared: Confluence edits are no longer restricted in this session.", "warning");
+						return;
+					case "save": {
+						if (value !== "global" && value !== "project") {
+							ctx.ui.notify("Usage: /atlassian-pages save global|project", "error");
+							return;
+						}
+						if (pageScope.kind === "invalid") {
+							ctx.ui.notify("The current page scope is invalid. Add or clear pages first.", "error");
+							return;
+						}
+						await savePageScopes(value, ctx);
+						ctx.ui.notify(
+							`Saved ${activeScopes().length} page tree(s) ${value === "project" ? "for this project" : "globally"}. They load in every new session.`,
+							"info",
+						);
+						return;
+					}
+					default:
+						ctx.ui.notify("Usage: /atlassian-pages [add <url> | remove <url|id> | clear | save global|project | list]", "error");
+				}
+			} catch (err) {
+				ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+			}
 		},
 	});
 
