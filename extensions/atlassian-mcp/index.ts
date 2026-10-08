@@ -67,6 +67,7 @@ import { createRequire } from "node:module";
 import { CONFIG_DIR_NAME, formatSize, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { pickTools } from "./picker.ts";
+import { openPagesPanel, pageDetail, pageLabel, treeCount, type PagesPanelAction } from "./pages-panel.ts";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
 	classifyPageScopeTool,
@@ -563,6 +564,9 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		kind: "none",
 	};
 
+	/** Where the active page scope comes from, shown in /atlassian-pages. */
+	let scopeSource = "no restriction";
+
 	function activeScopes(): PageScope[] {
 		return pageScope.kind === "active" ? pageScope.policy.getScopes() : [];
 	}
@@ -575,7 +579,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 
 		const status =
 			next.kind === "active"
-				? `Confluence edits: ${next.policy.getScopes().length} page tree(s)`
+				? `Confluence edits: ${treeCount(next.policy.getScopes().length)}`
 				: next.kind === "invalid"
 					? "Confluence edits: blocked (invalid page scope)"
 					: undefined;
@@ -775,12 +779,17 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		}
 		if (inheritedScopes === "invalid") {
 			setPageScope({ kind: "invalid", reason: `${PAGE_SCOPES_ENV} is malformed` }, ctx);
+			scopeSource = "parent agent";
 		} else if (inheritedScopes) {
 			applyScopes(inheritedScopes, ctx);
+			scopeSource = "inherited from the parent agent";
 		} else if (configError) {
 			setPageScope({ kind: "invalid", reason: "the config file could not be read" }, ctx);
+			scopeSource = "config file";
 		} else {
-			applyScopes(scopedConfig?.config.pageScopes ?? [], ctx);
+			const saved = scopedConfig?.config.pageScopes ?? [];
+			applyScopes(saved, ctx);
+			scopeSource = saved.length > 0 ? `${scopedConfig!.scope} default` : "no restriction";
 		}
 
 		// A subagent has no UI and therefore no picker: mirror whatever the parent
@@ -961,54 +970,113 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 		const scopes = activeScopes();
 		if (scopes.length === 0) return "No page scope: Confluence edits are not restricted.";
 		return [
-			"Confluence edits are allowed only in these page trees (root page and all descendants). Other pages stay readable:",
-			...scopes.map((s) => `  - ${s.title ?? "(untitled)"} - https://${s.siteHost}/wiki/pages/viewpage.action?pageId=${s.rootPageId}`),
+			`The agent can edit only these page trees (${scopeSource}). All other Confluence pages are read-only:`,
+			...scopes.map((s) => `  ✎ ${pageLabel(s)} - ${pageDetail(s)}`),
 		].join("\n");
 	}
 
+	/** Ask for a URL, check it with Confluence, and return the updated draft. */
+	async function addToDraft(draft: PageScope[], ctx: Parameters<typeof scopeCallTool>[0] & { ui: { input: (t: string, p?: string) => Promise<string | undefined> } }) {
+		const url = await ctx.ui.input(
+			"Paste the URL of a Confluence page. The agent can then edit this page and all its child pages.",
+			"https://<site>.atlassian.net/wiki/spaces/<space>/pages/<id>/...",
+		);
+		if (!url?.trim()) return draft;
+		const parsed = parseConfluencePageUrl(url);
+		if (!parsed) {
+			ctx.ui.notify("That is not a Confluence page URL (https://<site>.atlassian.net/wiki/spaces/<space>/pages/<id>/...).", "error");
+			return draft;
+		}
+		if (draft.some((s) => pageScopeKey(s) === pageScopeKey(parsed))) {
+			ctx.ui.notify("This page is already in the list.", "info");
+			return draft;
+		}
+		ctx.ui.notify(`Checking page ${parsed.rootPageId} with Confluence...`, "info");
+		try {
+			const root = await validatePageScopeRoot(parsed, scopeCallTool(ctx));
+			return [...draft, root];
+		} catch (err) {
+			ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+			return draft;
+		}
+	}
+
+	type PagesCtx = Parameters<typeof addToDraft>[1] &
+		Parameters<typeof savePageScopes>[1] &
+		Parameters<typeof openPagesPanel>[0] & { ui: { setStatus?: (key: string, text: string | undefined) => void } };
+
+	/** The interactive /atlassian-pages panel: edit a draft, then apply or save it. */
+	async function runPagesPanel(ctx: PagesCtx) {
+		let draft = activeScopes();
+		let focusAction: PagesPanelAction | undefined;
+		while (true) {
+			const result = await openPagesPanel(ctx, {
+				draft,
+				active: activeScopes(),
+				source: scopeSource,
+				invalidReason: pageScope.kind === "invalid" ? pageScope.reason : undefined,
+				canSaveProject: ctx.isProjectTrusted(),
+				focusAction,
+			});
+			if (!result) return;
+			draft = result.draft;
+			if (result.action === "add") {
+				const before = draft.length;
+				draft = await addToDraft(draft, ctx);
+				// After a successful add, the next likely step is to apply it.
+				focusAction = draft.length > before ? "session" : "add";
+				continue;
+			}
+
+			if (result.action !== "session") {
+				applyScopes(draft, ctx);
+				try {
+					await savePageScopes(result.action, ctx);
+				} catch (err) {
+					scopeSource = "this session (save failed)";
+					ctx.ui.notify(`Atlassian MCP: ${(err as Error).message}`, "error");
+					return;
+				}
+				scopeSource = draft.length > 0 ? `${result.action} default` : "no restriction";
+				ctx.ui.notify(
+					draft.length > 0
+						? `Saved ${treeCount(draft.length)} as ${result.action} default. Other Confluence pages are read-only.`
+						: `Saved: no page scope as ${result.action} default. Confluence edits are not restricted.`,
+					"info",
+				);
+				return;
+			}
+
+			applyScopes(draft, ctx);
+			scopeSource = draft.length > 0 ? "this session (not saved)" : "no restriction";
+			ctx.ui.notify(
+				draft.length > 0
+					? `The agent can now edit ${treeCount(draft.length)} in this session. Other Confluence pages are read-only.`
+					: "Page scope removed: Confluence edits are not restricted in this session.",
+				draft.length > 0 ? "info" : "warning",
+			);
+			return;
+		}
+	}
+
 	pi.registerCommand("atlassian-pages", {
-		description: "Restrict Confluence edits to page trees: /atlassian-pages [add <url> | remove <url|id> | clear | save global|project | list]",
+		description: "Choose the Confluence page trees the agent may edit; all other pages stay read-only",
 		getArgumentCompletions: (prefix: string) => {
 			const subcommands = ["add ", "remove ", "clear", "save global", "save project", "list"];
 			const matches = subcommands.filter((s) => s.startsWith(prefix.trimStart()));
 			return matches.length > 0 ? matches.map((s) => ({ value: s, label: s.trim() })) : null;
 		},
 		handler: async (args, ctx) => {
-			let [sub = "", ...rest] = args.trim().split(/\s+/).filter(Boolean);
-			let value = rest.join(" ");
+			const [sub = "", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			const value = rest.join(" ");
 
 			if (!sub) {
-				ctx.ui.notify(describeScopes(), "info");
-				if (!ctx.hasUI) return;
-				const choice = await ctx.ui.select("Confluence page scope", [
-					"Add a root page (URL)",
-					"Remove a root page",
-					"Clear (allow all Confluence edits)",
-					"Save as global default",
-					"Save as project default",
-				]);
-				if (!choice) return;
-				if (choice.startsWith("Add")) {
-					sub = "add";
-					value = (await ctx.ui.input("Confluence page URL", "https://<site>.atlassian.net/wiki/spaces/<space>/pages/<id>/...")) ?? "";
-					if (!value.trim()) return;
-				} else if (choice.startsWith("Remove")) {
-					const scopes = activeScopes();
-					if (scopes.length === 0) {
-						ctx.ui.notify("No root pages to remove.", "info");
-						return;
-					}
-					const labels = scopes.map((s) => `${s.title ?? "(untitled)"} (${s.rootPageId})`);
-					const picked = await ctx.ui.select("Remove root page", labels);
-					if (!picked) return;
-					sub = "remove";
-					value = scopes[labels.indexOf(picked)]!.rootPageId;
-				} else if (choice.startsWith("Clear")) {
-					sub = "clear";
-				} else {
-					sub = "save";
-					value = choice.includes("global") ? "global" : "project";
+				if (!ctx.hasUI) {
+					ctx.ui.notify(describeScopes(), "info");
+					return;
 				}
+				await runPagesPanel(ctx);
+				return;
 			}
 
 			try {
@@ -1029,6 +1097,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 							return;
 						}
 						applyScopes([...current, root], ctx);
+						scopeSource = "this session (not saved)";
 						ctx.ui.notify(
 							`Confluence edits now restricted for this session. Added "${root.title ?? root.rootPageId}" and all its descendants. Use "/atlassian-pages save global|project" to keep it.`,
 							"info",
@@ -1044,6 +1113,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 							return;
 						}
 						applyScopes(next, ctx);
+						scopeSource = next.length > 0 ? "this session (not saved)" : "no restriction";
 						ctx.ui.notify(
 							next.length > 0 ? `Removed page ${id} from the page scope (session only).` : "Page scope removed: Confluence edits are no longer restricted in this session.",
 							next.length > 0 ? "info" : "warning",
@@ -1052,6 +1122,7 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 					}
 					case "clear":
 						applyScopes([], ctx);
+						scopeSource = "no restriction";
 						ctx.ui.notify("Page scope cleared: Confluence edits are no longer restricted in this session.", "warning");
 						return;
 					case "save": {
@@ -1064,8 +1135,9 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 							return;
 						}
 						await savePageScopes(value, ctx);
+						if (activeScopes().length > 0) scopeSource = `${value} default`;
 						ctx.ui.notify(
-							`Saved ${activeScopes().length} page tree(s) ${value === "project" ? "for this project" : "globally"}. They load in every new session.`,
+							`Saved ${treeCount(activeScopes().length)} ${value === "project" ? "for this project" : "globally"}. They load in every new session.`,
 							"info",
 						);
 						return;

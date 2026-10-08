@@ -74,6 +74,27 @@ The picker pre-fills from what is live in the session, falling back to the effec
 Use a page scope when the agent may edit some Confluence pages but must only read all others.
 Pick one or more root pages. Each root page and all its descendants can be edited. All other pages stay readable but cannot be edited.
 
+Run `/atlassian-pages` to open the page scope panel:
+
+```text
+Confluence page scope
+The agent can edit 1 page tree. All other Confluence pages are read-only.
+Now active: project default
+
+→ ✎ Claude Code - setup and settings  rewe.atlassian.net · page 1658063227 + all child pages
+  + Add root page                     Paste a Confluence page URL
+  ▸ Apply to this session             Not saved; new sessions use the saved default
+  ▸ Save as global default            Apply now and in every new session
+  ▸ Save as project default           Apply now and in new sessions in this project
+
+↑/↓ move  ·  enter select  ·  d or del remove page  ·  esc discard changes
+```
+
+Changes are a draft until you choose a `▸` action. `esc` discards them.
+The footer shows the active scope, for example `Confluence edits: 1 page tree`.
+
+For scripts and quick edits, the same actions are available as subcommands:
+
 ```text
 /atlassian-pages add https://rewe.atlassian.net/wiki/spaces/ATools/pages/1658063227/Claude+Code+-+setup+and+settings
 /atlassian-pages save project      # or: save global
@@ -81,7 +102,7 @@ Pick one or more root pages. Each root page and all its descendants can be edite
 
 | Subcommand | What it does |
 |---|---|
-| *(none)* | Show the current scope and open a menu |
+| *(none)* | Open the page scope panel |
 | `add <page URL>` | Check the page with Confluence and add it as a root page for this session |
 | `remove <page URL or ID>` | Remove a root page from this session |
 | `clear` | Remove the scope: Confluence edits are not restricted |

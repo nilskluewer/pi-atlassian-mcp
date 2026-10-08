@@ -13,6 +13,7 @@ import {
 	parseConfluencePageUrl,
 } from "../extensions/atlassian-mcp/scope.ts";
 import { writeFile, mkdir } from "node:fs/promises";
+import { openPagesPanel } from "../extensions/atlassian-mcp/pages-panel.ts";
 import { inheritedPageScopes, loadEffectiveConfig, PAGE_SCOPES_ENV, registerMcpTool, saveConfig } from "../extensions/atlassian-mcp/index.ts";
 
 let passed = 0;
@@ -244,6 +245,27 @@ await checkAsync("requests descendants within the Confluence depth limit", async
 	};
 	await assert.rejects(() => new PageScopePolicy([root]).authorize("updateConfluencePage", { cloudId: root.siteHost, pageId: outside, body: "x" }, callTool));
 	assert.equal(depth, 10);
+});
+
+console.log("pages panel (non-TUI fallback)");
+await checkAsync("removes a page and applies the draft through select dialogs", async () => {
+	const other = { siteHost: "rewe.atlassian.net", rootPageId: "1658063227", title: "Claude Code" };
+	const answers = [`Remove: ${root.title} (${root.rootPageId})`, "▸ Save as project default"];
+	const titles: string[] = [];
+	const result = await openPagesPanel(
+		{ mode: "rpc", ui: { custom: async () => { throw new Error("no components in rpc"); }, select: async (title) => { titles.push(title); return answers.shift(); } } },
+		{ draft: [root, other], active: [root, other], source: "project default", canSaveProject: true },
+	);
+	assert.deepEqual(result, { action: "project", draft: [other] });
+	assert.match(titles[0]!, /2 page trees/);
+	assert.match(titles[1]!, /1 page tree,/);
+});
+await checkAsync("cancel in the fallback changes nothing", async () => {
+	const result = await openPagesPanel(
+		{ mode: "rpc", ui: { custom: async () => undefined as never, select: async () => undefined } },
+		{ draft: [root], active: [root], source: "global default", canSaveProject: false },
+	);
+	assert.equal(result, undefined);
 });
 
 console.log("inherited page scope");
