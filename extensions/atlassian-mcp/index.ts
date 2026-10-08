@@ -1,5 +1,5 @@
 /**
- * Atlassian Rovo MCP bridge extension.
+ * Atlassian MCP (v2) bridge extension.
  *
  * Connects to the remote Atlassian MCP server (https://github.com/atlassian/atlassian-mcp-server)
  * via the `mcp-remote` stdio bridge (handles OAuth + token caching), discovers its tools,
@@ -47,7 +47,7 @@
  * Config files:
  *   ~/.pi/agent/atlassian-mcp.json          (global defaults)
  *   <project>/.pi/atlassian-mcp.json        (trusted-project override)
- *   { "autoStart": false, "enabledTools": ["getConfluencePage"],
+ *   { "autoStart": false, "enabledTools": ["getConfluenceContent"],
  *     "pageScopes": [{ "siteHost": "rewe.atlassian.net", "rootPageId": "1658063227" }] }
  *   ~/.pi/agent/atlassian-mcp.cache.json    (tool definitions, auto-managed)
  *
@@ -81,7 +81,13 @@ import {
 	type PageScope,
 } from "./scope.ts";
 
-const SERVER_URL = "https://mcp.atlassian.com/v1/mcp";
+/**
+ * Atlassian MCP v2, flat catalog. Without `?tools=all` the server advertises only
+ * discover/execute* gateway tools, which would defeat per-tool selection and the
+ * page-scope policy. Override with PI_ATLASSIAN_MCP_URL (for example to pin v1).
+ */
+const DEFAULT_SERVER_URL = "https://mcp.atlassian.com/v2/mcp?tools=all";
+const SERVER_URL = process.env.PI_ATLASSIAN_MCP_URL || DEFAULT_SERVER_URL;
 const TOOL_PREFIX = "atlassian_";
 const GLOBAL_CONFIG_DIR = join(homedir(), CONFIG_DIR_NAME, "agent");
 const GLOBAL_CONFIG_PATH = join(GLOBAL_CONFIG_DIR, "atlassian-mcp.json");
@@ -89,7 +95,9 @@ const CONFIG_FILE_NAME = "atlassian-mcp.json";
 
 /** Discovered tool definitions, cached so non-interactive sessions start cheaply. */
 const TOOL_CACHE_PATH = process.env.PI_ATLASSIAN_MCP_CACHE_PATH || join(GLOBAL_CONFIG_DIR, "atlassian-mcp.cache.json");
-const TOOL_CACHE_VERSION = 1;
+const TOOL_CACHE_VERSION = 2;
+/** Upper bound for catalog pages, so a misbehaving server cannot loop forever. */
+const MAX_TOOL_PAGES = 20;
 const TOOL_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
@@ -187,20 +195,49 @@ type NotifyCtx = { ui: { notify: (message: string, type?: "error" | "info" | "wa
  * grouping, so "this tool" would be ambiguous to the model.
  */
 const TOOL_GUIDELINES: Record<string, string[]> = {
-	getConfluencePage: [
-		"When atlassian_getConfluencePage returns an empty or whitespace-only body, retry with contentFormat: \"html\" before concluding the page is empty. Pages built from macros (for example Aura panels) render as blank in markdown but carry their real content, headlines and links in the HTML form.",
-		"When an atlassian_getConfluencePage body turns out to be only macro tiles or links, treat the page as a navigation hub rather than documentation, and call atlassian_getConfluencePageDescendants to locate the pages that hold the actual content.",
+	getConfluenceContent: [
+		"When an atlassian_getConfluenceContent body turns out to be only macro tiles or links, treat the page as a navigation hub rather than documentation, and call atlassian_getConfluenceContentDescendants to locate the pages that hold the actual content.",
 	],
-	getConfluencePageDescendants: [
-		"When listing results from atlassian_getConfluencePageDescendants, check each entry's status field and flag any draft pages, especially drafts whose title duplicates a published sibling, before relying on or citing them.",
+	getConfluenceContentDescendants: [
+		"When listing results from atlassian_getConfluenceContentDescendants, check each entry's status field and flag any draft pages, especially drafts whose title duplicates a published sibling, before relying on or citing them.",
 	],
-	updateConfluencePage: [
-		"When atlassian_updateConfluencePage fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Report this to the user and do not try another way to change the page.",
+	updateConfluenceContent: [
+		"When atlassian_updateConfluenceContent fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Report this to the user and do not try another way to change the page.",
 	],
-	createConfluencePage: [
-		"When atlassian_createConfluencePage fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Pass a parentId inside an allowed tree, or report the block to the user.",
+	createConfluenceContent: [
+		"When atlassian_createConfluenceContent fails with \"Atlassian page scope blocked\", the user has restricted Confluence edits to selected page trees. Use contentType \"page\" and pass parent.parentContentId inside an allowed tree, or report the block to the user.",
 	],
 };
+
+/**
+ * Tools renamed by Atlassian MCP v2. Saved selections keep working: an old name
+ * is replaced by its v2 name when the config is read.
+ */
+const V1_TOOL_RENAMES: Record<string, string> = {
+	getConfluencePage: "getConfluenceContent",
+	createConfluencePage: "createConfluenceContent",
+	updateConfluencePage: "updateConfluenceContent",
+	getConfluencePageDescendants: "getConfluenceContentDescendants",
+	searchConfluenceUsingCql: "searchConfluence",
+	getConfluenceSpaces: "listConfluenceSpaces",
+	getPagesInConfluenceSpace: "listConfluenceContent",
+	getConfluencePageFooterComments: "listConfluenceComments",
+	getConfluencePageInlineComments: "listConfluenceComments",
+	createConfluenceFooterComment: "createConfluenceComment",
+	createConfluenceInlineComment: "createConfluenceComment",
+	getTransitionsForJiraIssue: "listJiraIssueTransitions",
+	getJiraIssueRemoteIssueLinks: "listJiraIssueRemoteIssueLinks",
+	getVisibleJiraProjects: "listJiraProjects",
+	getJiraProjectIssueTypesMetadata: "listJiraProjectIssueTypesMetadata",
+	addCommentToJiraIssue: "addOrEditJiraIssueComment",
+	addWorklogToJiraIssue: "addOrEditJiraIssueWorklog",
+	getIssueLinkTypes: "listJiraIssueLinkTypes",
+	createIssueLink: "createJiraIssueLink",
+};
+
+function migrateToolNames(names: string[]): string[] {
+	return [...new Set(names.map((n) => V1_TOOL_RENAMES[n] ?? n))];
+}
 
 const DEFAULT_CONFIG: Config = { autoStart: false, enabledTools: [] };
 
@@ -228,7 +265,7 @@ async function readConfig(path: string): Promise<Config | undefined> {
 
 	return {
 		autoStart: parsed.autoStart === true,
-		enabledTools: Array.isArray(parsed.enabledTools) ? parsed.enabledTools.filter((n) => typeof n === "string") : [],
+		enabledTools: Array.isArray(parsed.enabledTools) ? migrateToolNames(parsed.enabledTools.filter((n) => typeof n === "string")) : [],
 		...(parsed.pageScopes !== undefined ? { pageScopes: parsePageScopes(parsed.pageScopes, path) } : {}),
 	};
 }
@@ -302,13 +339,13 @@ export function inheritedToolNames(): string[] {
  * cache only ever accelerates startup; a miss falls back to a live connection.
  */
 function readToolCache(): McpToolDef[] | undefined {
-	let parsed: { version?: unknown; fetchedAt?: unknown; tools?: unknown };
+	let parsed: { version?: unknown; serverUrl?: unknown; fetchedAt?: unknown; tools?: unknown };
 	try {
 		parsed = JSON.parse(readFileSync(TOOL_CACHE_PATH, "utf8"));
 	} catch {
 		return undefined;
 	}
-	if (parsed.version !== TOOL_CACHE_VERSION) return undefined;
+	if (parsed.version !== TOOL_CACHE_VERSION || parsed.serverUrl !== SERVER_URL) return undefined;
 	const fetchedAt = typeof parsed.fetchedAt === "number" ? parsed.fetchedAt : 0;
 	if (!fetchedAt || Date.now() - fetchedAt > TOOL_CACHE_MAX_AGE_MS) return undefined;
 	if (!Array.isArray(parsed.tools)) return undefined;
@@ -328,6 +365,7 @@ async function writeToolCache(tools: McpToolDef[]): Promise<void> {
 			JSON.stringify(
 				{
 					version: TOOL_CACHE_VERSION,
+					serverUrl: SERVER_URL,
 					fetchedAt: Date.now(),
 					tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
 				},
@@ -691,8 +729,16 @@ export default function atlassianMcpExtension(pi: ExtensionAPI) {
 
 	async function discoverTools(ctx: NotifyCtx): Promise<McpToolDef[]> {
 		const c = await connect(ctx);
-		const { tools } = await c.listTools();
-		discoveredTools = (tools as McpToolDef[]).filter((t) => TOOL_NAME_PATTERN.test(t.name));
+		// ?tools=all pages the catalog (50 tools per page) with the standard MCP cursor.
+		const all: McpToolDef[] = [];
+		let cursor: string | undefined;
+		for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+			const res = await c.listTools(cursor ? { cursor } : {});
+			all.push(...(res.tools as McpToolDef[]));
+			if (!res.nextCursor || res.nextCursor === cursor) break;
+			cursor = res.nextCursor;
+		}
+		discoveredTools = all.filter((t) => TOOL_NAME_PATTERN.test(t.name));
 		await writeToolCache(discoveredTools);
 		return discoveredTools;
 	}

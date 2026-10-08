@@ -31,7 +31,7 @@ try {
 			fetchedAt: Date.now(),
 			tools: [
 				{
-					name: "getConfluencePage",
+					name: "getConfluenceContent",
 					description: "Get a Confluence page",
 					inputSchema: { type: "object", properties: {}, additionalProperties: false },
 				},
@@ -59,7 +59,7 @@ export default function (pi) {
 
 await saveConfig("project", projectDir, {
 	autoStart: true,
-	enabledTools: ["getConfluencePage"],
+	enabledTools: ["getConfluenceContent"],
 	pageScopes: [{ siteHost: "rewe.atlassian.net", rootPageId: "1657441488" }],
 });
 async function probe(approval: "default" | "--approve" | "--no-approve"): Promise<{ trusted: boolean; active: string[] }> {
@@ -119,12 +119,12 @@ const trustedFirst = await probe("default");
 const trustedReopen = await probe("default");
 assert.equal(trustedFirst.trusted, true);
 assert.equal(trustedReopen.trusted, true);
-assert.ok(trustedFirst.active.includes("atlassian_getConfluencePage"));
+assert.ok(trustedFirst.active.includes("atlassian_getConfluenceContent"));
 assert.deepEqual(trustedReopen.active, trustedFirst.active);
 
 const untrusted = await probe("--no-approve");
 assert.equal(untrusted.trusted, false);
-assert.equal(untrusted.active.includes("atlassian_getConfluencePage"), false);
+assert.equal(untrusted.active.includes("atlassian_getConfluenceContent"), false);
 
 console.log("ok project persistence across fresh Pi processes");
 } finally {

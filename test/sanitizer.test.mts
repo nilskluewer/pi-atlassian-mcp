@@ -148,7 +148,7 @@ check("leaves results under the limit unchanged after the notice", () => {
 
 console.log("TOOL_NAME_PATTERN");
 check("accepts real Atlassian tool names", () => {
-	for (const n of ["getConfluencePage", "atlassianUserInfo", "getAccessibleAtlassianResources"]) {
+	for (const n of ["getConfluenceContent", "atlassianUserInfo", "getAccessibleAtlassianResources"]) {
 		assert.ok(TOOL_NAME_PATTERN.test(n), n);
 	}
 });
@@ -162,8 +162,8 @@ check("rejects names that could break out of the namespace", () => {
 console.log("subagent tool inheritance");
 check("takes only well-formed atlassian_ entries from the parent tool set", () => {
 	process.env.PI_SUBAGENT_INHERITED_TOOLS =
-		"read,bash,atlassian_getConfluencePage,atlassian_search,atlassian_getConfluencePage,web_search";
-	assert.deepEqual(inheritedToolNames(), ["getConfluencePage", "search"]);
+		"read,bash,atlassian_getConfluenceContent,atlassian_search,atlassian_getConfluenceContent,web_search";
+	assert.deepEqual(inheritedToolNames(), ["getConfluenceContent", "search"]);
 });
 check("refuses inherited names that are not valid MCP tool names", () => {
 	process.env.PI_SUBAGENT_INHERITED_TOOLS = "atlassian_../evil,atlassian_,atlassian_ok";
@@ -179,15 +179,23 @@ const projectDir = await mkdtemp(join(tmpdir(), "pi-atlassian-mcp-test-"));
 try {
 	await saveConfig("project", projectDir, {
 		autoStart: true,
-		enabledTools: ["getConfluencePage"],
+		enabledTools: ["getConfluenceContent"],
 	});
 	const effective = await loadEffectiveConfig(projectDir, true);
 	assert.deepEqual(effective, {
 		scope: "project",
-		config: { autoStart: true, enabledTools: ["getConfluencePage"] },
+		config: { autoStart: true, enabledTools: ["getConfluenceContent"] },
 	});
 	passed++;
 	console.log("  ok  trusted project configuration overrides global defaults");
+	await saveConfig("project", projectDir, {
+		autoStart: true,
+		enabledTools: ["getConfluencePage", "getConfluenceContent", "createConfluenceFooterComment", "createConfluenceInlineComment", "getJiraIssue"],
+	});
+	const migrated = await loadEffectiveConfig(projectDir, true);
+	assert.deepEqual(migrated.config.enabledTools, ["getConfluenceContent", "createConfluenceComment", "getJiraIssue"]);
+	passed++;
+	console.log("  ok  saved v1 tool names are renamed to v2 names without duplicates");
 } finally {
 	await rm(projectDir, { recursive: true, force: true });
 }

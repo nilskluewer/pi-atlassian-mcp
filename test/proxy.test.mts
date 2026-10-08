@@ -44,7 +44,7 @@ try {
 		assert.ok(captured, "must reach the stdio transport");
 		const options = captured as { args: string[]; env: Record<string, string> };
 		assert.equal(options.args.includes("--enable-proxy"), Boolean(proxy));
-		assert.equal(options.args[1], "https://mcp.atlassian.com/v1/mcp");
+		assert.equal(options.args[1], "https://mcp.atlassian.com/v2/mcp?tools=all");
 		for (const name of forwarded) assert.equal(options.env[name], process.env[name], name);
 		assert.equal(options.env.PROXY_TEST_SECRET, undefined);
 		assert.equal(options.env.HOME, process.env.HOME);

@@ -47,25 +47,15 @@ export type ScopeCallTool = (
 
 export type PageScopeToolClass = "confluence-write" | "confluence-read" | "other";
 
-const CONFLUENCE_WRITE_TOOLS = new Set([
-	"createConfluencePage",
-	"updateConfluencePage",
-	"createConfluenceFooterComment",
-	"createConfluenceInlineComment",
-]);
+/** The only Confluence write tools the page-scope policy knows how to authorize. */
+const CONFLUENCE_WRITE_TOOLS = new Set(["createConfluenceContent", "updateConfluenceContent", "createConfluenceComment"]);
 
-const CONFLUENCE_READ_TOOLS = new Set([
-	"getConfluencePage",
-	"getConfluencePageDescendants",
-	"getConfluenceSpaces",
-	"getPagesInConfluenceSpace",
-	"getConfluencePageFooterComments",
-	"getConfluencePageInlineComments",
-	"getConfluenceCommentChildren",
-	"searchConfluenceUsingCql",
-	"search",
-	"fetch",
-]);
+/** Generic gateway tools of the default (deferred) endpoint. They wrap any tool, so they cannot be checked. */
+const GATEWAY_WRITE_TOOLS = new Set(["executeWrite", "executeDestructive"]);
+
+/** Read-only verbs. A Confluence tool with one of these prefixes never changes content. */
+const READ_PREFIX = /^(get|list|search|diff|download|export|resolve)[A-Z]/;
+const GENERIC_READ_TOOLS = new Set(["search", "fetch"]);
 
 /** Tools that never touch Confluence content. */
 const UNRELATED_TOOLS = new Set(["atlassianUserInfo", "getAccessibleAtlassianResources", "getContentFormatGuide"]);
@@ -75,9 +65,10 @@ const UNRELATED_TOOLS = new Set(["atlassianUserInfo", "getAccessibleAtlassianRes
  * Confluence-like tools. Unknown Jira or metadata tools remain unaffected.
  */
 export function classifyPageScopeTool(name: string): PageScopeToolClass {
-	if (CONFLUENCE_WRITE_TOOLS.has(name)) return "confluence-write";
-	if (CONFLUENCE_READ_TOOLS.has(name)) return "confluence-read";
+	if (CONFLUENCE_WRITE_TOOLS.has(name) || GATEWAY_WRITE_TOOLS.has(name)) return "confluence-write";
+	if (GENERIC_READ_TOOLS.has(name)) return "confluence-read";
 	if (UNRELATED_TOOLS.has(name)) return "other";
+	if (/confluence/i.test(name) && READ_PREFIX.test(name)) return "confluence-read";
 	// Jira tools such as addCommentToJiraIssue must not match the Confluence keywords below.
 	if (/jira|issue|worklog/i.test(name) && !/confluence/i.test(name)) return "other";
 	if (/confluence|page|comment|blogpost|attachment|whiteboard|database|content/i.test(name)) return "confluence-write";
@@ -374,7 +365,8 @@ function extractCloudResources(result: unknown): CloudResource[] {
 	const seen = new Set<string>();
 	for (const payload of payloadsFromResult(result)) {
 		walkRecords(payload, (record) => {
-			const cloudId = normalizedUuid(record.id);
+			// v2 names the field cloudId; v1 used id.
+			const cloudId = normalizedUuid(record.cloudId) ?? normalizedUuid(record.id);
 			const url = stringValue(record.url) ?? stringValue(record.baseUrl) ?? stringValue(record.href);
 			const siteHost = normalizeSiteHost(url);
 			if (!cloudId || !siteHost) return;
@@ -413,7 +405,7 @@ export class PageScopePolicy {
 
 	/** Remember pages created through an authorized call until this session ends. */
 	noteSuccessfulCall(name: string, args: Record<string, unknown>, result: unknown): void {
-		if (name !== "createConfluencePage" || isErrorResult(result)) return;
+		if (name !== "createConfluenceContent" || isErrorResult(result)) return;
 		const normalized = normalizeCloudId(args.cloudId);
 		if (!normalized) return;
 		const matching = this.scopes.filter(
@@ -439,45 +431,45 @@ export class PageScopePolicy {
 			throw this.blocked(name, "the operation is not explicitly supported by the page-scope policy");
 		}
 
-		if (name === "createConfluencePage") {
-			this.rejectBlogs(name, args);
-			if (!stringValue(args.parentId)) {
-				throw this.blocked(name, "new pages must specify a parent inside the configured page tree");
+		if (name === "createConfluenceContent") {
+			if (args.contentType !== "page") throw this.blocked(name, "only contentType \"page\" is allowed while a page scope is active");
+			const parent = isRecord(args.parent) ? args.parent : {};
+			if (parent.parentContentUrl !== undefined) {
+				throw this.blocked(name, "use parent.parentContentId instead of parentContentUrl so the parent can be checked");
 			}
-			await this.requirePage(args.cloudId, args.parentId, callTool, signal);
-			await this.requireSpace(args.cloudId, args.spaceId, callTool, signal);
+			if (!stringValue(parent.parentContentId)) {
+				throw this.blocked(name, "new pages must specify parent.parentContentId inside the configured page tree");
+			}
+			await this.requirePage(args.cloudId, parent.parentContentId, callTool, signal);
+			if (parent.spaceId !== undefined) await this.requireSpace(args.cloudId, parent.spaceId, callTool, signal);
 			return args;
 		}
 
-		if (name === "updateConfluencePage") {
-			this.rejectBlogs(name, args);
-			await this.requirePage(args.cloudId, args.pageId, callTool, signal);
-			if (args.parentId !== undefined) await this.requirePage(args.cloudId, args.parentId, callTool, signal);
-			if (args.spaceId !== undefined) await this.requireSpace(args.cloudId, args.spaceId, callTool, signal);
+		if (name === "updateConfluenceContent") {
+			// A URL or an owner transfer cannot be proven to stay inside the tree.
+			for (const key of ["contentUrl", "ownerId"]) {
+				if (args[key] !== undefined && args[key] !== null && args[key] !== "") {
+					throw this.blocked(name, `${key} is not supported while a page scope is active; pass contentId`);
+				}
+			}
+			await this.requirePage(args.cloudId, args.contentId, callTool, signal);
 			return args;
 		}
 
-		this.rejectBlogs(name, args);
-		// A reply or a comment on an attachment targets that object, not pageId,
-		// so pageId alone cannot prove where the comment lands.
-		for (const key of ["parentCommentId", "attachmentId", "customContentId"]) {
-			if (args[key] !== undefined && args[key] !== null && args[key] !== "") {
-				throw this.blocked(name, `${key} is not supported while a page scope is active; comment on the page itself`);
-			}
+		// createConfluenceComment
+		// A reply targets a comment, not a page, so contentId alone cannot prove where it lands.
+		if (args.parentCommentId !== undefined && args.parentCommentId !== null && args.parentCommentId !== "") {
+			throw this.blocked(name, "parentCommentId is not supported while a page scope is active; comment on the page itself");
 		}
-		if (!stringValue(args.pageId)) {
-			throw this.blocked(name, "pass pageId so the comment target can be checked against the page scope");
+		if (!stringValue(args.contentId)) {
+			throw this.blocked(name, "pass contentId so the comment target can be checked against the page scope");
 		}
-		await this.requirePage(args.cloudId, args.pageId, callTool, signal);
+		await this.requirePage(args.cloudId, args.contentId, callTool, signal);
 		return args;
 	}
 
 	private blocked(name: string, reason: string): PageScopeDeniedError {
 		return new PageScopeDeniedError(`Atlassian page scope blocked ${name}: ${reason}.`);
-	}
-
-	private rejectBlogs(name: string, args: Record<string, unknown>): void {
-		if (args.contentType === "blog") throw this.blocked(name, "blog posts are outside a page-tree scope");
 	}
 
 	private async matchingScopes(cloudValue: unknown, callTool: ScopeCallTool, signal?: AbortSignal): Promise<PageScope[]> {
@@ -531,7 +523,7 @@ export class PageScopePolicy {
 		// Query the scoped ancestor first. This is normally one cheap request and
 		// never reads an arbitrary candidate page outside the configured tree.
 		const searchResult = await callTool(
-			"searchConfluenceUsingCql",
+			"searchConfluence",
 			{
 				cloudId: scopeCloudValue(scope),
 				cql: `ancestor = ${scope.rootPageId} AND id = ${pageId} AND type = page`,
@@ -546,10 +538,10 @@ export class PageScopePolicy {
 		let cursor: string | undefined;
 		for (let request = 0; request < MAX_DESCENDANT_REQUESTS; request++) {
 			const descendantResult = await callTool(
-				"getConfluencePageDescendants",
+				"getConfluenceContentDescendants",
 				{
 					cloudId: scopeCloudValue(scope),
-					pageId: scope.rootPageId,
+					contentId: scope.rootPageId,
 					limit: MAX_DESCENDANT_PAGES,
 					depth: MAX_DESCENDANT_DEPTH,
 					...(cursor ? { cursor } : {}),
@@ -589,8 +581,8 @@ export class PageScopePolicy {
 		const cached = this.metadataCache.get(cacheKey);
 		if (cached?.spaceId) return cached.spaceId;
 		const result = await callTool(
-			"getConfluencePage",
-			{ cloudId: scopeCloudValue(scope), pageId: scope.rootPageId, contentFormat: "markdown" },
+			"getConfluenceContent",
+			{ cloudId: scopeCloudValue(scope), content_id: scope.rootPageId, detail: "summary" },
 			signal,
 		);
 		if (isErrorResult(result)) return undefined;
@@ -612,8 +604,8 @@ export async function validatePageScopeRoot(
 	const resources = isErrorResult(resourceResult) ? [] : extractCloudResources(resourceResult);
 	const resource = resources.find((candidate) => candidate.siteHost === normalized.siteHost);
 	const result = await callTool(
-		"getConfluencePage",
-		{ cloudId: resource?.cloudId ?? normalized.siteHost, pageId: normalized.rootPageId, contentFormat: "markdown" },
+		"getConfluenceContent",
+		{ cloudId: resource?.cloudId ?? normalized.siteHost, content_id: normalized.rootPageId, detail: "summary" },
 		signal,
 	);
 	if (isErrorResult(result)) throw new Error("Confluence rejected the configured root page.");

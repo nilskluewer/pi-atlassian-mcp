@@ -1,7 +1,7 @@
 {
   "name": "@nilskluewer/pi-atlassian-mcp",
   "version": "0.2.2",
-  "description": "Bridge the Atlassian Rovo MCP server (Jira, Confluence) into Pi with per-session, opt-in tool selection.",
+  "description": "Bridge the Atlassian MCP server v2 (Jira, Confluence, Bitbucket, Loom) into Pi with per-session, opt-in tool selection.",
   "type": "module",
   "keywords": [
     "pi-package",

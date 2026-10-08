@@ -1,13 +1,13 @@
 # pi-atlassian-mcp
 
-Bridge the [Atlassian Rovo MCP server](https://github.com/atlassian/atlassian-mcp-server) (Jira, Confluence, Compass, Bitbucket) into [Pi](https://pi.dev), with **per-session, opt-in tool selection** and optional **Confluence page-tree authorization**.
+Bridge the [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-server) (Jira, Confluence, Compass, Bitbucket) into [Pi](https://pi.dev), with **per-session, opt-in tool selection** and optional **Confluence page-tree authorization**.
 
 Pi deliberately ships without built-in MCP support.
 This extension adds it for one specific server, and adds the thing a generic MCP client usually lacks: precise control over *which* tools are exposed and *when*.
 
 ## Why tool selection matters
 
-The Rovo server exposes a lot of tools.
+The Atlassian MCP server exposes a lot of tools (about 140 in its full catalog).
 Every active tool costs context window on every single request, whether or not you touch Jira that day.
 
 This extension therefore activates **nothing** by default.
@@ -24,6 +24,27 @@ A browser window opens on first use.
 
 `mcp-remote` is an **exact dependency** invoked through its locally installed binary, not an unpinned `npx -y` fetch, so the executed version is fixed by this package's published dependency manifest rather than resolved from the registry at runtime.
 
+## Atlassian MCP v2
+
+The extension connects to `https://mcp.atlassian.com/v2/mcp?tools=all`.
+`?tools=all` returns the full tool catalog as a flat, paged list (50 tools per page).
+The extension needs this list for per-tool selection and the page scope.
+The default v2 endpoint advertises only `discover` and `execute*` gateway tools instead.
+
+If you used an older version of this extension:
+
+- The first connection opens the browser once for a new login.
+  If the login fails, run `/atlassian-reconnect` or delete `~/.mcp-auth`.
+- Many tools have new names, for example `getConfluencePage` is now `getConfluenceContent`.
+  Saved `enabledTools` entries with a v1 name are renamed when the config is read.
+- `/atlassian-tools` lists more tools now (Bitbucket, Loom, goals, projects, and more).
+  Nothing is active until you select it.
+- Some tool groups are off by default and need an admin to enable them (`manage_jira`, `delete_*`).
+  Your organization can also require an allowed-domains entry for the client.
+
+Set `PI_ATLASSIAN_MCP_URL` to use another endpoint.
+The v1 endpoint still works, but its tool names are not known to the page scope: with an active page scope, all Confluence writes on v1 are refused.
+
 ## Trust model
 
 The MCP server is a remote third party, so everything it returns is treated as untrusted input:
@@ -33,7 +54,7 @@ The MCP server is a remote third party, so everything it returns is treated as u
 - **Descriptions** are stripped of control characters and truncated before they reach the system prompt.
 - **Tool results** are fenced with an explicit untrusted-data notice, because Confluence and Jira content is attacker-influencable and would otherwise read to the model like instructions.
 
-This hardening is a safety net, not a functional restriction: all 31 tools currently exposed by the Atlassian server pass unchanged, with no schema altered.
+This hardening is a safety net, not a functional restriction: all 143 tools currently exposed by the Atlassian server pass unchanged, with no schema altered.
 
 It does **not** make prompt injection impossible. Anyone who can edit a page you fetch can put text in front of the model. Treat Atlassian content as you would any untrusted web page.
 
@@ -112,10 +133,11 @@ For scripts and quick edits, the same actions are available as subcommands:
 The scope is an authorization check in the extension, not a prompt instruction.
 Every Confluence write is checked immediately before it is sent to the MCP server:
 
-- `updateConfluencePage` - the page must be in a scoped tree. A move (`parentId`, `spaceId`) must also stay in the tree.
-- `createConfluencePage` - `parentId` is required and must be in a scoped tree, in the root page's space.
-- `createConfluenceFooterComment` / `createConfluenceInlineComment` - `pageId` must be in a scoped tree. Replies and comments on attachments are refused, because `pageId` cannot prove where they land.
-- Blog posts and Confluence write tools that the policy does not know are refused.
+- `updateConfluenceContent` - `contentId` must be in a scoped tree. `contentUrl` and `ownerId` are refused, because they cannot be checked.
+- `createConfluenceContent` - `contentType` must be `page`. `parent.parentContentId` is required and must be in a scoped tree. A `parent.spaceId` must be the root page's space.
+- `createConfluenceComment` - `contentId` must be in a scoped tree. Replies (`parentCommentId`) are refused, because they cannot be tied to a page.
+- Every other Confluence write tool is refused (for example move, copy, archive, attachments, permissions).
+  So are the `executeWrite` and `executeDestructive` gateway tools.
 - Reads, search, and Jira tools are not affected.
 
 Tree membership is checked with a CQL `ancestor` search, with the descendants endpoint as a fallback.
@@ -144,7 +166,7 @@ Both files use the same shape and are written only when you explicitly save:
 ```json
 {
   "autoStart": true,
-  "enabledTools": ["getConfluencePage", "getJiraIssue"],
+  "enabledTools": ["getConfluenceContent", "getJiraIssue"],
   "pageScopes": [{ "siteHost": "rewe.atlassian.net", "rootPageId": "1658063227" }]
 }
 ```
@@ -160,7 +182,7 @@ It is written automatically, refreshed whenever the picker or `/atlassian-reconn
 Use `/atlassian-autostart` to toggle the effective scope.
 Use `/atlassian-autostart global` or `/atlassian-autostart project` to change a specific scope.
 
-Tools are exposed to the model as `atlassian_<mcpToolName>`, for example `atlassian_getConfluencePage`.
+Tools are exposed to the model as `atlassian_<mcpToolName>`, for example `atlassian_getConfluenceContent`.
 
 ## Proxy support
 
@@ -175,12 +197,10 @@ Thanks to [@tihartmann](https://github.com/tihartmann) for contributing this in 
 Some MCP tools have quirks their own descriptions do not mention.
 `TOOL_GUIDELINES` in `extensions/atlassian-mcp/index.ts` attaches extra guidance to individual tools via Pi's `promptGuidelines`, which is injected into the system prompt **only while that tool is active** - so unused hints cost nothing.
 
-Shipped hints, both learned the hard way:
+Shipped hints:
 
-- **`getConfluencePage`** - if the body comes back empty, retry with `contentFormat: "html"`.
-  Pages built from macros (such as Aura panels) render as blank in markdown while the HTML carries the real content, headlines, and links.
-  If the body turns out to be only tiles and links, treat the page as a navigation hub and call `getConfluencePageDescendants`.
-- **`getConfluencePageDescendants`** - check each entry's `status` and flag drafts, especially drafts whose title duplicates a published sibling.
+- **`getConfluenceContent`** - if the body turns out to be only tiles and links, treat the page as a navigation hub and call `getConfluenceContentDescendants`.
+- **`getConfluenceContentDescendants`** - check each entry's `status` and flag drafts, especially drafts whose title duplicates a published sibling.
 
 To add your own, add an entry keyed by the raw MCP tool name.
 
