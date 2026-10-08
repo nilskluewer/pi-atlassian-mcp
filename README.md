@@ -103,6 +103,14 @@ Use `/atlassian-autostart global` or `/atlassian-autostart project` to change a 
 
 Tools are exposed to the model as `atlassian_<mcpToolName>`, for example `atlassian_getConfluencePage`.
 
+## Proxy support
+
+The extension works behind HTTP proxies.
+It passes `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (upper and lower case), `NODE_EXTRA_CA_CERTS`, and `SSL_CERT_FILE` to `mcp-remote`.
+When a proxy variable is set, it starts `mcp-remote` with `--enable-proxy`.
+
+Thanks to [@tihartmann](https://github.com/tihartmann) for contributing this in [#1](https://github.com/nilskluewer/pi-atlassian-mcp/pull/1).
+
 ## Tool hints
 
 Some MCP tools have quirks their own descriptions do not mention.
