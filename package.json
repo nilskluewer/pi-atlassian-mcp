@@ -51,7 +51,7 @@
   },
   "scripts": {
     "pack:dry": "npm pack --dry-run",
-    "test": "tsx test/sanitizer.test.mts"
+    "test": "tsx test/sanitizer.test.mts && tsx test/proxy.test.mts"
   },
   "devDependencies": {
     "@earendil-works/pi-tui": "^0.83.0",
