@@ -17,8 +17,12 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - name: Install Pi
+        run: npm install -g @earendil-works/pi-coding-agent@latest
       - run: npm ci
       - run: npm test
+      - name: Smoke test (load the packed tarball in Pi)
+        run: npm run smoke
       - name: Check tag matches package.json
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
       - run: npm publish --access public --provenance

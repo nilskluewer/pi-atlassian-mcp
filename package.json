@@ -52,7 +52,9 @@
   "scripts": {
     "pack:dry": "npm pack --dry-run",
     "test": "tsx test/sanitizer.test.mts && tsx test/proxy.test.mts && tsx test/scope.test.mts",
-    "test:e2e": "tsx test/project-persistence.e2e.mts"
+    "test:e2e": "tsx test/project-persistence.e2e.mts",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run smoke"
   },
   "devDependencies": {
     "@earendil-works/pi-tui": "^0.83.0",

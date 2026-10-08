@@ -10,9 +10,9 @@ Steps:
    ```bash
    git switch main && git pull && git status -s
    ```
-2. Run the tests:
+2. Run the tests and the smoke test. The smoke test installs the packed tarball into a clean folder and loads it in a real Pi process, which catches imports that only work inside the repo:
    ```bash
-   npm ci && npm test
+   npm ci && npm test && npm run smoke
    ```
 3. Bump the version. This edits `package.json` and the lockfile, commits, and creates the tag `vX.Y.Z`:
    ```bash
