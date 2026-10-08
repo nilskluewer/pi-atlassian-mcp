@@ -22,8 +22,6 @@ jobs:
       - name: Check tag matches package.json
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
       - run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
